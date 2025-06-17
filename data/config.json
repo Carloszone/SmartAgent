@@ -1,14 +1,14 @@
 {
     "model_api_key": "AIzaSyDdxgb9VQfMgXjE7Iq9xlyWtB_H_SYKgms",
     "generative_model_name": "gemini-2.5-flash-preview-05-20",
-    "embeding_model_name": "gemini-embedding-001",
+    "embeding_model_name": "text-embedding-004",
     "document_directory": "/data/Documents",
     "vector_database_config": {
         "host": "localhost",
         "port": 8080,
         "grpc_port": 50051,
-        "knewledge_base_collection_name": "",
-        "chat_collection_name": ""
+        "knewledge_base_collection_name": "knowledge_base_collection",
+        "chat_collection_name": "chat_history_collection"
     },
     "traditional_database_config": {
         "host": "localhost",

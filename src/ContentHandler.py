@@ -40,6 +40,8 @@ class ContentHandler:
             template = self.jinja2_env.get_template("WindowMarkdownTemplate.jinja2")
         elif mode == "chunker":
             template = self.jinja2_env.get_template("ChunkSplitterTemplate.jinja2")
+        elif mode =='text_summary':
+            template = self.jinja2_env.get_template("TextSummaryTemplate.jinja2")
         else:
             raise ValueError(f'mode参数错误，当前参数为{mode}')
         final_prompt = template.render(**content)

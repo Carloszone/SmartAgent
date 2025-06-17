@@ -34,11 +34,19 @@
     {"chunks": ["第一个语义完整的文本块...", "第二个文本块，它可能包含多个段落...", "第三个文本块..."]}
 
 
+{% if above_content %}
 ### 传入的上文页内容
 {{ above_content }}
+{% endif %}
 
-### 传入的目标页内容
+
+{% if target_content %}
+### 传入的目标页面内容
 {{ target_content }}
+{% endif %}
 
+
+{% if below_content %}
 ### 传入的下文页内容
 {{ below_content }}
+{% endif %}
