@@ -42,6 +42,10 @@ class ContentHandler:
             template = self.jinja2_env.get_template("ChunkSplitterTemplate.jinja2")
         elif mode =='text_summary':
             template = self.jinja2_env.get_template("TextSummaryTemplate.jinja2")
+        elif mode == 're-rank':
+            template = self.jinja2_env.get_template("QueryRerankTemplate.jinja2")
+        elif mode == "topic_extraction":
+            template = self.jinja2_env.get_template("TopicExtractionTemplate.jinja2")
         else:
             raise ValueError(f'mode参数错误，当前参数为{mode}')
         final_prompt = template.render(**content)
