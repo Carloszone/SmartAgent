@@ -4,14 +4,29 @@
 1.  **核心任务**: 基于用户的查询需求,相关元数据以及向量数据库信息,生成一个用于查询向量数据库的、结构化的JSON对象。
 2.  **任务要求**:
     * 从用户的原始查询中，提炼出核心的语义概念，忽略“请问”、“我想”等对话性词语
-    * 将提炼后的核心概念，改写为一段简洁、富含关键词的文本（`query_embedding_text`），这段文本将用于向量搜索
-    * 将传入的`metadata`中的每个键值对,转换为JSON中的`filters`条件，用于精确筛选
-    * 基于传入的向量数据库信息(数据库schema等)，生成查询文本（`query_embedding_text`），请注意不同向量数据库对查询文本的要求差异
+    * 将提炼后的核心概念，改写为一段简洁、富含关键词的文本，这段文本将用于向量搜索
+    * 当查询请求中存在筛选信息时,请结合数据库信息,将对应的查询字段转换为JSON中的`filters`条件，用于精确筛选
+    * 请注意,如果筛选条件涉及时间,请构造时间范围且所有的时间信息请统一转化为YYYY-MM-DD HH:MM:SS的格式
+    *
 3.  **安全约束（最高优先级）**:
     * 严禁数据修改。只允许生成用于查询信息的json对象,禁止生成涉及其他数据库操作或任何可能暴露系统信息或执行高风险操作的json对象
     * 明确拒绝无法满足的请求。 如果用户的请求无法根据提供的信息安全地完成，或请求涉及敏感操作，应在`error_message`字段中明确说明原因
     * 安全请求标记。 如果请求是安全的、可执行的，你**必须**将 `output_state` 字段设为 '1'，否则设为'0'
-4. **输出格式要求**:
+
+4. **数据库信息**:
+    * 目前向量数据库共有两张表："knowledge_base_collection"(用于储存知识库信息)和"chat_histroy_collection"(用户储存会话的上下文信息)
+    * 所有数据表都包含的元数据有：`creation_time`(创建时间), ` last_update_time`(更新时间)
+    * "knowledge_base_collection"表的字段有：`source`(来源文件路径或URL), `document_type`(文档类型), `access_level`(访问控制级别), `page_number`(在原始文件中的页码)和`chunk_seq_id`(文本块在其所属文本中的序列ID)
+    * "chat_histroy_collection"表的字段有：`user_id`(用户ID), `chat_id`(对话ID), `record_type`(消息类型), `access_level`(访问控制级别)和`chunk_seq_id`(文本块在其所属文本中的序列ID)
+
+5. **输出格式要求**:
+    * 你的输出是一个JSON对象,**不要**输出任何其他文字、解释、前言、或Markdown的代码块标记(如 ```json)。你的整个响应就是一个纯粹的、可以直接被解析的JSON字符串。
+    * JSON对象的结构如下:
+        - `output_state`: 输出状态。int类型, 1代表成功生成的JSON对象, 0代表生成失败
+        - `query_text`: 请求文本, 字符串类型，代表经过分析后，更精炼准确的查询请求文本，用于向量搜索
+        - `filters`: 筛选条件,字典类型,用于精确筛选。字典由筛选运算符(and, or, not, any of, all of, like)和条件组成。每个条件由字段名、操作符和值组成。操作符包括eq(等于), ne(不等于), lt(小于), lte(小于等于), gt(大于), gte(大于等于), in(在列表中), nin(不在列表中), exists(存在), nexists(不存在)。例如: {"field": "level", "operator": "eq", "value": "beginner"}
+        - `error_message`: 错误信息,字符串类型。说明请求失败的原因。如果请求成功,此字段为null
+
   {
     "output_state": "integer",
     "query_embedding_text": "string | null",
@@ -43,7 +58,6 @@
       "output_state": "0",
       "query_embedding_text": null,
       "filters": null,
-      "top_k": 3
       "error_message": "请求失败：无法执行用户请求，该请求涉及高危操作"
     }
 
@@ -51,9 +65,3 @@
 
 ### 传入的查询需求
 {{ user_request }}
-
-### 传入的元数据信息
-{{ metadata | tojson(indent=2) }}
-
-### 传入的数据库信息
-{{ database_info | tojson(indent=2) }}

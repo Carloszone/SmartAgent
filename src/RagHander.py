@@ -824,11 +824,15 @@ class RAGTool:
         # 关闭数据库连接
         self.close_weavier_connection()
 
-    def search_knowledge_base(self, request):
-        """请求向量数据库,从知识库中搜索相关信息"""
+    def search_vector_database(self, request, collection):
+        """
+        请求向量数据库,从知识库中搜索相关信息
+        """
         # 搜索请求提炼
 
         # 获取搜索参数
+
+        # 请求向量化
 
         # 近似搜索
 

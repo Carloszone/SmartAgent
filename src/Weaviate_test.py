@@ -3,6 +3,7 @@ import weaviate
 from weaviate.classes.config import Configure, Property, DataType, Vectorizers
 # v4 版本中，查询相关的类（如 Filter）需要从 weaviate.classes.query 导入
 from weaviate.classes.query import Filter
+from weaviate.classes.query import MetadataQuery
 import json
 
 # --- 第一步：连接到您的 Weaviate 服务 ---
@@ -114,13 +115,20 @@ try:
     # )
     # print(f"✅ Collection '{collection_name}' 创建成功！")
 
-    collection = client.collections.get("chat_histroy_collection")
+    collection = client.collections.get("knowledge_base_collection")
     response = collection.query.fetch_objects(
         limit=1,
-        include_vector=True
+        include_vector=True,
+        return_metadata=MetadataQuery(
+            creation_time=True,
+            last_update_time=True,
+            distance=True,
+            certainty=True,
+            score=True
+        )
     )
     print("查询返回：")
-    print(response.objects[0].vector)
+    print(response.objects[0])
 
 
 except Exception as e:
