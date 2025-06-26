@@ -22,8 +22,8 @@ class ConfigManager:
 
         # 从JSON文件加载
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(current_script_dir)
-        config_file_path = os.path.join(project_root, 'data/config.json')
+
+        config_file_path = os.path.join(current_script_dir, 'config.json')
         try:
             with open(config_file_path, 'r', encoding='utf-8') as f:
                 self._config_data = json.load(f)

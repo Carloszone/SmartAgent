@@ -1,9 +1,8 @@
 import weaviate
-# v4 版本中，配置相关的类（如 Property, DataType）需要从 weaviate.classes.config 导入
-from weaviate.classes.config import Configure, Property, DataType, Vectorizers
-# v4 版本中，查询相关的类（如 Filter）需要从 weaviate.classes.query 导入
+from weaviate.classes.config import Configure, Property, DataType, Vectorizers, Tokenization
 from weaviate.classes.query import Filter
 from weaviate.classes.query import MetadataQuery
+from ConfigManager import config
 import json
 
 # --- 第一步：连接到您的 Weaviate 服务 ---
@@ -15,120 +14,182 @@ try:
     )
     print("成功连接到 Weaviate!")
 
-    # # --- 第二步：删除全部collections ---
-    # if client.is_ready(): # is_ready() 检查连接
-    #     client.collections.delete_all()
+    # --- 第二步：删除全部collections ---
+    if client.is_ready(): # is_ready() 检查连接
+        client.collections.delete_all()
 
-    # # --- 第三步：定义新 Collection 的名称和字段结构 ---
-    # collection_name = "knowledge_base_collection"
+    # --- 第三步：定义新 Collection 的名称和字段结构 ---
+    embeding_model_name = config.get_setting('models')["text_embedding_model_name"]
+    collection_name = "knowledge_base_collection"
     
-    # properties_to_create = [
-    #     Property(
-    #         name="source",
-    #         description="来源文件路径或URL",
-    #         data_type=DataType.TEXT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="document_type",
-    #         description="文档类型 (e.g., PDF, DOCX, MD)",
-    #         data_type=DataType.TEXT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="access_level",
-    #         description="访问控制级别",
-    #         data_type=DataType.INT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="page_number",
-    #         description="在原始文件中的页码",
-    #         data_type=DataType.INT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="chunk_seq_id",
-    #         description="文本块在其所属文本中的序列ID",
-    #         data_type=DataType.INT,
-    #         index_filterable=True
-    #     ),
-    # ]
+    properties_to_create = [
+        Property(
+            name="content",
+            description="原始文本",
+            data_type=DataType.TEXT,
+            tokenization=Tokenization.GSE,
+            index_searchable=True
+        ),
+        Property(
+            name="summary",
+            description="原始文本的概括",
+            data_type=DataType.TEXT,
+            tokenization=Tokenization.GSE,
+            index_searchable=True
+        ),
+        Property(
+            name="questions",
+            description="原始文本的派生问题",
+            data_type=DataType.TEXT,
+            tokenization=Tokenization.GSE,
+            index_searchable=True
+        ),
+        Property(
+            name="source",
+            description="来源文件路径或URL",
+            data_type=DataType.TEXT,
+            index_filterable=True
+        ),
+        Property(
+            name="document_type",
+            description="文档类型 (e.g., PDF, DOCX, MD)",
+            data_type=DataType.TEXT,
+            index_filterable=True
+        ),
+        Property(
+            name="access_level",
+            description="访问控制级别",
+            data_type=DataType.INT,
+            index_filterable=True
+        ),
+        Property(
+            name="page_number",
+            description="在原始文件中的页码",
+            data_type=DataType.INT,
+            index_filterable=True
+        ),
+        Property(
+            name="chunk_seq_id",
+            description="文本块在其所属文本中的序列ID",
+            data_type=DataType.INT,
+            index_filterable=True
+        ),
+    ]
 
 
-    # # --- 第四步：创建新的 Collection ---
-    # print(f"\n## 正在创建新的 Collection: '{collection_name}'...")
-    # client.collections.create(
-    #     name=collection_name,
-    #     properties=properties_to_create,
-    #     # 因为您要直接传入 embedding，所以必须将 vectorizer 设置为 none
-    #     vectorizer_config=Configure.Vectorizer.none()
-    # )
-    # print(f"✅ Collection '{collection_name}' 创建成功！")
-
-
-    # # --- 重复第三步和第四步，构建第二张表 ---
-    # collection_name = "chat_histroy_collection"
-    
-    # properties_to_create = [
-    #     Property(
-    #         name="chat_id",
-    #         description="聊天会话id",
-    #         data_type=DataType.TEXT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="user_id",
-    #         description="发起聊天的用户的id",
-    #         data_type=DataType.TEXT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="record_type",
-    #         description="对应文本所属类型,可以是请求(reqeust)或回答(answer)",
-    #         data_type=DataType.TEXT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="access_level",
-    #         description="访问控制级别",
-    #         data_type=DataType.INT,
-    #         index_filterable=True
-    #     ),
-    #     Property(
-    #         name="chunk_seq_id",
-    #         description="文本块在其所属文本中的序列ID",
-    #         data_type=DataType.INT,
-    #         index_filterable=True
-    #     ),
-    # ]
-
-
-    # print(f"\n## 正在创建新的 Collection: '{collection_name}'...")
-    # client.collections.create(
-    #     name=collection_name,
-    #     properties=properties_to_create,
-    #     vectorizer_config=[
-    #         Configure.NamedVectors.none(name='chunk_vector'),
-    #         Configure.NamedVectors.none(name='topic_vector')
-    #     ]
-    # )
-    # print(f"✅ Collection '{collection_name}' 创建成功！")
-
-    collection = client.collections.get("knowledge_base_collection")
-    response = collection.query.fetch_objects(
-        limit=1,
-        include_vector=True,
-        return_metadata=MetadataQuery(
-            creation_time=True,
-            last_update_time=True,
-            distance=True,
-            certainty=True,
-            score=True
-        )
+    # --- 第四步：创建新的 Collection ---
+    print(f"\n## 正在创建新的 Collection: '{collection_name}'...")
+    client.collections.create(
+        name=collection_name,
+        vectorizer_config=[
+            Configure.NamedVectors.text2vec_ollama(
+                name="content_vector",
+                source_properties=["content"],
+                api_endpoint="http://ollama-host:11434",
+                model=embeding_model_name
+            ),
+            Configure.NamedVectors.text2vec_ollama(
+                name="summary_vector",
+                source_properties=["summary"],
+                api_endpoint="http://ollama-host:11434",
+                model=embeding_model_name
+            ),
+            Configure.NamedVectors.text2vec_ollama(
+                name="question_vector",
+                source_properties=["questions"],
+                api_endpoint="http://ollama-host:11434",
+                model=embeding_model_name
+            )
+        ],
+        properties=properties_to_create
     )
-    print("查询返回：")
-    print(response.objects[0])
+    print(f"✅ Collection '{collection_name}' 创建成功！")
+
+
+    # --- 重复第三步和第四步，构建第二张表 ---
+    collection_name = "chat_histroy_collection"
+    
+    properties_to_create = [
+        Property(
+            name="question",
+            description="问题",
+            data_type=DataType.TEXT,
+            tokenization=Tokenization.GSE,
+            index_searchable=True
+        ),
+        Property(
+            name="answer",
+            description="回答",
+            data_type=DataType.TEXT,
+            tokenization=Tokenization.GSE,
+            index_searchable=True
+        ),
+        Property(
+            name="chat_id",
+            description="聊天会话id",
+            data_type=DataType.TEXT,
+            index_filterable=True
+        ),
+        Property(
+            name="user_id",
+            description="发起聊天的用户的id",
+            data_type=DataType.TEXT,
+            index_filterable=True
+        ),
+        Property(
+            name="access_level",
+            description="访问控制级别",
+            data_type=DataType.INT,
+            index_filterable=True
+        ),
+        Property(
+            name="chunk_seq_id",
+            description="文本块在其所属文本中的序列ID",
+            data_type=DataType.INT,
+            index_filterable=True
+        ),
+    ]
+
+
+    print(f"\n## 正在创建新的 Collection: '{collection_name}'...")
+    client.collections.create(
+        name=collection_name,
+        properties=properties_to_create,
+        vectorizer_config=[
+            Configure.NamedVectors.text2vec_ollama(
+                name="question_vector",
+                source_properties=["question"],
+                api_endpoint="http://ollama-host:11434",
+                model=embeding_model_name
+            ),
+            Configure.NamedVectors.text2vec_ollama(
+                name="answer_vector",
+                source_properties=["answer"],
+                api_endpoint="http://ollama-host:11434",
+                model=embeding_model_name
+            )
+        ]
+    )
+    print(f"✅ Collection '{collection_name}' 创建成功！")
+
+    # ---  查询
+
+    # collection = client.collections.get("knowledge_base_collection")
+    # config = collection.config.get()
+    # print(config.properties)
+    # response = collection.query.fetch_objects(
+    #     limit=1,
+    #     include_vector=True,
+    #     return_metadata=MetadataQuery(
+    #         creation_time=True,
+    #         last_update_time=True,
+    #         distance=True,
+    #         certainty=True,
+    #         score=True
+    #     )
+    # )
+    # print("查询返回：")
+    # print(response.objects[0])
 
 
 except Exception as e:
