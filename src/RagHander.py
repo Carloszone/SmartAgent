@@ -1,4 +1,4 @@
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, UnstructuredWordDocumentLoader
+from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, UnstructuredWordDocumentLoader, UnstructuredPDFLoader
 from ConfigManager import config
 import os
 import re
@@ -18,6 +18,8 @@ import ollama
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 import tqdm
+import markdown
+from bs4 import BeautifulSoup
 
 
 
@@ -29,20 +31,39 @@ class RAGTool:
         # 模型相关
         self.ollama_client = None  # ollama客户端
         self.async_ollama_client = None  # 异步ollama客户断
-        self.audio_model_1 = None  # 音频模型1
-        self.audio_model_2 = None  # 音频模型2
+        self.audio_model = None  # 音频模型1
+        self.generative_model_name = config.get_setting("models")["generative_model_name"]  # 生成模型名称
+        self.text_embedding_model_name = config.get_setting("models")["text_embedding_model_name"]  # 文本embedding模型
+        self.audio_model_address = config.get_setting("models")["audio_model_address_1"]  # 音频模型的地址
+        self.audio_vad_model_address = config.get_setting("models")["audio_vad_model_address"]  # 音频ad模型地址
+        self.image_embedding_model_name = config.get_setting("models")["image_embedding_model_name"]  #  图像embedding模型
+        self.ollama_model_option = config.get_setting("models")["ollama_model_option"]  # ollama模型额外参数
 
-        # 客户端信息
+
+        # 数据库相关
         self.vector_database_client = None  # 向量数据库的客户端
-        # self.redis_database_client = redis_client  # redis数据库的客户端
-        # self.session_ttl_s = session_ttl_s  # redis过期时间
+        self.vector_database_host = config.get_setting("vector_database")["host"]  # 向量数据库的地址
+        self.vector_database_port = config.get_setting("vector_database")["port"]  # 向量数据库的端口
+        self.vector_database_grpc_port = config.get_setting("vector_database")["grpc_port"]  # 向量数据库的grpc端口
+        self.knewledge_base_collection_name = config.get_setting("vector_database")["knewledge_base_collection_name"]  # 知识库collection的名称
+        self.chat_collection_name = config.get_setting("vector_database")["chat_collection_name"]  # 聊天记录collection的名称
         
-        # 文档类型-解析工具映射表
+
+        # 文档类型相关
+        self.document_types = config.get_setting("file_types")["text_file_extension"]  # 文档后缀
+        self.table_types = config.get_setting("file_types")["table_file_extension"]  # 表格后缀
+        self.audio_types = config.get_setting("file_types")["audio_file_extension"]  # 音频后缀
+        self.image_types = config.get_setting("file_types")["image_file_extension"]  # 图像后缀
+
         self.file_loader_mapping = {
-            ".pdf": PyMuPDFLoader,
+            ".pdf": UnstructuredPDFLoader,
             ".docx": UnstructuredWordDocumentLoader,
             ".txt": TextLoader
         }
+
+        # 其他参数：
+        self.model_retry_num = 3  # 遇到模型报错时的重试次数
+        self.concurrency_limit = 4  # 并发控制最大数
 
     ###################################################### 数据库操作函数  ######################################################
     def save_to_vector_database(self, data_dict: dict = None, mode="knowledge_base"):
@@ -56,9 +77,9 @@ class RAGTool:
         else:
             # 提取配置信息
             if mode == "knowledge_base":
-                vector_database_collection_name = config.get_setting('vector_database').get('knewledge_base_collection_name')
+                vector_database_collection_name = self.knewledge_base_collection_name
             elif mode == "chat_history":
-                vector_database_collection_name = config.get_setting('vector_database').get('chat_collection_name')
+                vector_database_collection_name = self.chat_collection_name
             else:
                 raise ValueError(f'参数mode错误，当前参数为{mode}')
 
@@ -126,30 +147,16 @@ class RAGTool:
             file_extension = os.path.splitext(file_path)[1].lower()
 
             # 匹配预设的文件类型，并返回
-            if file_extension in config.get_setting('file_types')["text_file_extension"]:
+            if file_extension in self.document_types:
                 return "text"
-            elif file_extension in config.get_setting('file_types')["audio_file_extension"]:
+            elif file_extension in self.audio_types:
                 return "audio"
-            elif file_extension in config.get_setting('file_types')["table_file_extension"]:
+            elif file_extension in self.table_types:
                 return "table"
-            elif file_extension in config.get_setting('file_types')["image_file_extension"]:
+            elif file_extension in self.image_types:
                 return "image"
             else:
                 raise ValueError(f'不支持的文件格式:{file_extension}')
-    
-    def audio_to_text(self, audio_path):
-        """
-        对音频文件进行语音识别的函数
-        """
-        res = self.audio_model_1.generate(
-            input=f"data/Audios/vad_example.wav", # 
-            cache={},
-            language="auto",  # "zn", "en", "yue", "ja", "ko", "nospeech"
-            use_itn=True,
-            batch_size_s=60,
-            merge_vad=True,  #
-            merge_length_s=15,
-        )
 
     def file_reader(self, file_path) -> List:
         """
@@ -174,6 +181,26 @@ class RAGTool:
             print(f"警告：不支持的文件类型 {file_extension}，跳过文件 {file_path}")
             loader
             return []
+
+    def text_clear_formatting(self, docs:List[Document], metadata_dicts: List[dict]) -> List[Document]:
+        """
+        清除文档中的格式化信息,并生成Document对象
+        """
+        new_docs = []  # 储存清洗后的文档
+        for doc, meta in zip(docs, metadata_dicts):
+            # 转为纯文本
+            doc_text = doc.page_content
+            html = markdown.markdown(doc_text)
+            soup = BeautifulSoup(html, "html.paerser")
+            text = soup.get_text()
+
+            # 转为Document
+            text_doc = Document(page_content=text, metadata=meta)
+
+            # 保存对象
+            new_docs.append(text_doc)
+
+        return new_docs
 
     def clean_text(self, docs: List[Document]) -> List[Document]:
         """
@@ -221,6 +248,20 @@ class RAGTool:
             )
             content = allowed_chars.sub('', content)
 
+            # 去除表情
+            emoji_pattern = re.compile(
+                "["
+                "\U0001F600-\U0001F64F"  # emoticons
+                "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                "\U0001F680-\U0001F6FF"  # transport & map symbols
+                "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                "\U00002702-\U000027B0"
+                "\U000024C2-\U0001F251"
+                "]+",
+                flags=re.UNICODE,
+            )
+            content = emoji_pattern.sub(r'', content)
+
             # 去除开头和结尾处的空白字符
             content = content.strip()
 
@@ -267,7 +308,7 @@ class RAGTool:
                 )
         return window_docs
     
-    async def text_pitch(self, content: dict) -> Document:
+    async def text_fusion_async(self, content: dict) -> Document:
         """"
         基于上下文对当前页面的内容进行补完
         """
@@ -300,32 +341,49 @@ class RAGTool:
              }
         ]
 
-        # 模型交互
-        response = await self.async_client.chat(model=config.get_setting("models")["generative_model_name"], 
-                                                messages=message,
-                                                options=config.get_setting("models")["ollama_model_option"])
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
 
         # 提取输出json
-        output_json = json_extractor(response['message']['content'])
+        try:
+            output_json = json_extractor(response['message']['content'])
 
-        # 格式化输出
-        if "target_content" in output_json:
-            output_content = output_json["target_content"]
-            output_object = Document(page_content=output_content, metadata=target_document.metadata)
-        else:
-            output_object = None
-        return output_object
-    async def text_pitch_async(self, contents: List[dict]) -> List[Document]:
+            # 格式化输出
+            if "target_content" in output_json:
+                output_content = output_json["target_content"]
+                output_object = Document(page_content=output_content, metadata=target_document.metadata)
+                return output_object
+            else:
+                return last_exception
+        except ValueError as e:
+            return e
+
+    async def text_fusion_handler_async(self, contents: List[dict]) -> List[Document]:
         """
         对输入的文档内容进行内容拼接的函数(异步处理)
         """
         # print('拼接输入:', contents)
         tasks = [self.text_pitch(content) for content in contents]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        # print('拼接返回：')
-        # for i, result in enumerate(results):
-        #     print(i)
-        #     print(result)
+        print('拼接返回：')
+        for i, result in enumerate(results):
+            print(i)
+            print(result)
 
         # 过滤掉处理失败的结果
         successful_results = [res for res in results if isinstance(res, Document)]
@@ -335,7 +393,7 @@ class RAGTool:
             print(f'发现{len(results) - len(successful_results)}个文档拼接失败，跳过处理')
         return successful_results
 
-    async def text_chunk_splitter(self, content: Document) -> List[Document]:
+    async def text_chunk_splitter_async(self, content: Document) -> List[Document]:
         """
         基于markdown格式的分本分块函数
         """
@@ -355,26 +413,44 @@ class RAGTool:
              }
         ]
 
-        # 模型交互
-        response = await self.async_client.chat(model=config.get_setting("models")["generative_model_name"], 
-                                                messages=message,
-                                                options=config.get_setting("models")["ollama_model_option"])
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
  
         # 提取输出json
-        output_json = json_extractor(response['message']['content'])
+        try:
+            output_json = json_extractor(response['message']['content'])
 
-        # 返回格式化后的文档内容
-        formatted_chunkers = []
-        if "chunks" in output_json.keys():
-            output_list = output_json["chunks"]
-            for index, output_content in enumerate(output_list):
-                chunk_metadata = content.metadata
-                chunk_metadata['chunk_seq_id'] = index
-                chunk_document = Document(page_content=output_content, metadata=chunk_metadata)
-                formatted_chunkers.append(chunk_document)
-        return formatted_chunkers
+            # 返回格式化后的文档内容
+            formatted_chunkers = []
+            if "chunks" in output_json:
+                output_list = output_json["chunks"]
+                for index, output_content in enumerate(output_list):
+                    chunk_metadata = content.metadata
+                    chunk_metadata['chunk_seq_id'] = index
+                    chunk_document = Document(page_content=output_content, metadata=chunk_metadata)
+                    formatted_chunkers.append(chunk_document)
+                return formatted_chunkers
+            else:
+                return last_exception
+        except Exception as e:
+            return e
 
-    async def text_chunk_splitter_async(self, contents: List[Document]) -> List[Document]:
+    async def text_chunk_splitter_handler_async(self, contents: List[Document]) -> List[Document]:
         """
         基于markdown格式的文本分块函数(批量)
         """
@@ -393,7 +469,7 @@ class RAGTool:
                     output_results.append(res)
         return output_results
     
-    async def text_processor(self, content: Document) -> dict:
+    async def text_processor_async(self, content: Document) -> dict:
         """
         对文档块内容进行处理的函数（概括与问题派生）,以及生成哈希和uuid
         """
@@ -422,10 +498,23 @@ class RAGTool:
                 }
             ]
 
-            # 模型交互
-            response = await self.async_client.chat(model=config.get_setting("models")["generative_model_name"], 
-                                                    messages=message,
-                                                    options=config.get_setting("models")["ollama_model_option"])
+            # 模型交互,针对503错误重试
+            last_exception = None
+            for attempt in range(self.model_retry_num):
+                try:
+                    response = await self.async_client.chat(model=self.generative_model_name, 
+                                                            messages=message,
+                                                            options=self.ollama_model_option)
+                except ollama.ResponseError as e:
+                    if e.status_code == 503:
+                        last_exception = e
+                        wait_time = 2 * attempt
+                        print(f'遇到503错误，等待{wait_time}秒后重试...')
+                        await asyncio.sleep(wait_time)
+                    else:
+                        return e
+                except Exception as e:
+                    return e
 
             # 提取输出json
             summary_json = json_extractor(response['message']['content'])
@@ -450,10 +539,23 @@ class RAGTool:
             }
         ]
 
-        # 模型交互
-        response = await self.async_client.chat(model=config.get_setting("models")["generative_model_name"], 
-                                        messages=message,
-                                        options=config.get_setting("models")["ollama_model_option"])
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
         
         # 提取输出json
         question_json = json_extractor(response['message']['content'])
@@ -469,7 +571,7 @@ class RAGTool:
 
         return output_obejct
 
-    async def text_processor_async(self, contents) -> List[dict]:
+    async def text_processor_handler_async(self, contents) -> List[dict]:
         """
         对文档内容进行精简和概括的函数(批量)
         """
@@ -483,39 +585,6 @@ class RAGTool:
         # 结果过滤
         successful_results = [res for res in results if isinstance(res, dict)]
         return successful_results   
-
-    async def document_text_embeding_async(self, contents: list[dict]) -> list[dict]:
-        """
-        接受一个文本列表,并批量生成embeidngs
-        """
-        # 输入解析
-        all_text_to_embed = []
-        for content in contents:
-            all_text_to_embed.append(content["content"].page_content)
-            all_text_to_embed.append(content["summary"].page_content)
-            all_text_to_embed.append(content["questions"].page_content)
-
-        # 生成并执行任务
-        tasks = [asyncio.create_task(self.async_client.embeddings(model=self.embeding_model_name, prompt=text)) for text in all_text_to_embed]
-        responses = await asyncio.gather(*tasks)
-
-        # 结果解析
-        output_object = []
-        flat_embedding_list = [res['embedding'] for res in responses]
-        for i in range(0, len(flat_embedding_list), 3):
-            output_object.append({
-                "content_embedding": flat_embedding_list[i],
-                "summary_embedding": flat_embedding_list[i+1],
-                "questions_embedding": flat_embedding_list[i+2]
-            })
-
-        return output_object 
-    
-    async def chat_topic_embeddings(self, docs: List[Document]):
-        """
-        基于问答对生成主题和对应embeddings的函数
-        """
-        pass
     
     def save_knowledge_data_generator(self, contents:List[Document], metadata_dict:dict, image_embeddings: list):
         """
@@ -560,6 +629,176 @@ class RAGTool:
                 data_dict[uuid]["content_vector"] = image_embeddings
         return data_dict
 
+    async def audio_to_text_async(self, audio_path: str, meta: dict) -> Document:
+            """
+            对音频文件进行语音识别的函数
+            """
+            try:
+                res = self.audio_model_1.generate(
+                    input=audio_path, 
+                    cache={},
+                    language="auto",  # "zn", "en", "yue", "ja", "ko", "nospeech"
+                    use_itn=True,
+                    batch_size_s=60,
+                    merge_vad=True, 
+                    merge_length_s=15,
+                )
+                text = rich_transcription_postprocess(res[0]["text"])
+            except:
+                text = ""
+
+            # 结果输出
+            content = Document(page_content=text, metadata=meta)
+            return {'content': content}
+    
+    async def audio_to_text_handler_async(self, audio_paths: List[str], metas: List[dict]) -> List[Document]:
+        """
+        异步音频读取函数
+        """
+        # 任务生成与执行
+        tasks = [self.audio_to_text_async(path, meta) for path, meta in zip(audio_paths, metas)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 结果筛选
+        output_results = [result for result in results if isinstance(result, Document)]
+        return output_results
+
+    async def text_correction_async(self, text_dict: dict) -> Document:
+        """
+        对音频识别的结果进行纠偏处理
+        """
+        # 提取音频识别结果
+        text_1 = text_dict.get('text_1', "")
+        text_2 = text_dict.get('text_2', "")
+
+        # message构建
+        system_message = get_system_message('text_correction')
+        message = [
+            {
+                "role": "system",
+                "content": system_message
+             },
+             {
+                "role": "user",
+                "content": f"请结合两个版本的音频识别结果，对比校正的出一个纠正文本错误后的新版本。ARS识别结果1：{text_1} \nARS识别结果2:{text_2}" 
+             }
+        ]
+
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
+ 
+        # 提取输出json并处理
+        try:
+            output_json = json_extractor(response['message']['content'])
+            if "corrected_text" in output_json:
+                corrected_text = output_json["corrected_text"]
+                return Document(page_content=corrected_text, metadata={"page_number": 0})
+            else:
+                return last_exception
+        except ValueError as e:
+            return e
+
+    async def text_correction_handler_async(self, text_dict_list: List[dict]) -> List[Document]:
+        """
+        异步对音频识别文档结果进行纠错
+        """
+        # print(f'文档纠错输入内容：', contents)
+        tasks = [self.text_correction_async(text_dict) for text_dict in text_dict_list if isinstance(text_dict, dict)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # print(f'文档纠错输出内容：', len(results))
+
+        # 结果筛选
+        output_results = [result for result in results if isinstance(result, Document)]
+        return output_results
+    
+
+    ###################################################### 整合函数  ######################################################
+    async def text_pipeline_async(self, 
+                                  text_contents: List, 
+                                  do_text_clean: bool=True, 
+                                  do_text_correction: bool=False,
+                                  do_text_fusion: bool=False,
+                                  do_text_chunk: bool=True,
+                                  do_text_processor: bool=True) -> List[dict]:
+        """
+        文本处理流水线函数
+        """
+        # 文本去格式化(markdown转text)
+        processed_contents = self.text_clear_formatting(text_contents)
+
+        # 文本清洗
+        if do_text_clean:
+            processed_contents = self.clean_text(processed_contents)
+
+        # 文本纠正
+        if do_text_correction:
+            processed_contents = await self.text_correction_handler_async(processed_contents)
+
+        # 文本拼接
+        if do_text_fusion:
+            processed_contents = await self.text_fusion_handler_async(processed_contents)
+
+        # 文本分块
+        if do_text_chunk:
+            processed_contents = await self.text_chunk_splitter_handler_async(processed_contents)
+
+        # 文本处理
+        if do_text_processor:
+            processed_contents = await self.text_processor_handler_async(processed_contents)
+
+        #返回结果
+        return processed_contents
+
+
+    async def audio_pipeline(self, audio_paths: List[str], meta_dicts=List[dict]) -> List[dict]:
+        """
+        音频处理管道函数
+        """
+        # 音频识别
+        text_contents = await self.audio_to_text_handler_async(audio_paths=audio_paths, metas=meta_dicts)
+
+        # 文本处理
+        processed_content = await self.text_pipeline(text_contents=text_contents)
+
+        return processed_content
+
+    async def image_pipeline(self, image_paths: List, meta_dict: list[dict]) -> List[dict]:
+        """
+        图像处理管道函数
+        """
+        # 图像文本识别
+
+        # 图像描述
+
+        # 文本信息整合
+
+        # 文本处理
+
+        # 图像嵌入向量生成
+
+        # 整合结果
+
+        # 返回结果
+        pass
+
+
+
+
     
     ###################################################### 工具/流程函数  ######################################################
     def load_models(self):
@@ -572,42 +811,36 @@ class RAGTool:
 
         # 检查ollama模型是否存在本地
         local_models = [model["model"] for model in ollama.list()['models']]
-        generative_model_name = config.get_setting("models")["generative_model_name"]
-        tex_embedding_model_name = config.get_setting("models")["text_embedding_model_name"]
-        image_embedding_model_name = config.get_setting("models")["image_embedding_model_name"]
 
-        if generative_model_name not in local_models:
-            print(f'未找到ollama模型{generative_model_name},请检查')
-        if tex_embedding_model_name not in local_models:
-            print(f'未找到ollama模型{tex_embedding_model_name},请检查')
-        if image_embedding_model_name not in local_models:
-            print(f'未找到ollama模型{image_embedding_model_name},请检查')
+        if self.generative_model_name not in local_models:
+            print(f'未找到ollama模型{self.generative_model_name},请检查')
+        if self.text_embedding_model_name not in local_models:
+            print(f'未找到ollama模型{self.text_embedding_model_name},请检查')
+        if self.image_embedding_model_name not in local_models:
+            print(f'未找到ollama模型{self.image_embedding_model_name},请检查')
 
         # 加载音频识别函数
-        # audio_model_name_1 = config.get_setting('models')["audio_model_name_1"]
-        # audio_model_name_2 = config.get_setting('models')["audio_model_name_2"]
-        # for audio_model_name in [audio_model_name_1, audio_model_name_2]:
-        #     try:
-        #         self.audio_model_1 = AutoModel(
-        #             model=audio_model_name,
-        #             hub="huggingface",
-        #             vad_model="fsmn-vad",
-        #             vad_kwargs={"max_single_segment_time": 30000},
-        #             device="cuda:0",
-        #             disable_update = True,
-        #         )
-        #     except Exception as e:
-        #         print(f'音频模型加载失败')
+        audio_model_name = self.audio_model_address
+        audio_vad_mode_address = self.audio_vad_model_address
+        try:
+            self.audio_model = AutoModel(
+                model=audio_model_name,
+                vad_model=audio_vad_mode_address,
+                vad_kwargs={"max_single_segment_time": 30000},
+                device="cuda:0",
+                disable_update = True,
+            )
+        except Exception as e:
+            print(f'音频模型加载失败')
 
     def connect_to_weative_database(self):
         """
         创建一个到weative数据库的连接
         """
         # 参数提取
-        vector_database_config = config.get_setting('vector_database')
-        vector_database_host = vector_database_config.get('host')
-        vector_database_port = vector_database_config.get('port')
-        vector_database_grpc_port = vector_database_config.get('grpc_port')
+        vector_database_host = self.vector_database_host
+        vector_database_port = self.vector_database_port
+        vector_database_grpc_port = self.vector_database_grpc_port
 
         # 构建连接
         try:
@@ -636,86 +869,91 @@ class RAGTool:
         if self.vector_database_client:
             self.vector_database_client.close()
 
-    async def file_to_knowledge_database_async(self, file_path: str, metadata_dict: dict={}):
+    async def file_to_knowledge_database_async(self, file_path: str, metadata_dict: dict, semaphore: asyncio.Semaphore):
         """
         负责单个文件的ETF流程。这个函数内部包含了所有的异步和批量操作
         """
-        try:
-            # 1. 识别文件类型
-            print('识别文件类型')
-            file_type = self.file_type_identifier(file_path)
+        async with semaphore:
+            try:
+                # 1. 识别文件类型
+                print('识别文件类型')
+                file_type = self.file_type_identifier(file_path)
 
-            # 3 依据文件类型进行处理
-            print(f'当前文件的类型是：{file_type}')
-            image_embeddings = None
-            if file_type == "text":
-                # 3.1 文本文件处理
-                # 读取文件
-                print('读取文件')
-                raw_docs = self.file_reader(file_path)
-                print(f'### 读取文件{len(raw_docs)}个')
+                # 2 依据文件类型进行处理
+                print(f'当前文件的类型是：{file_type}')
+                image_embeddings = None
+                if file_type == "text":
+                    # 3.1 文本文件处理
+                    # 读取文件
+                    print('读取文件')
+                    raw_docs = self.file_reader(file_path)
+                    print(f'### 读取文件{len(raw_docs)}个')
 
-                # 文本清洗
-                print('文本清洗')
-                cleaned_docs = self.clean_text(raw_docs)
-                print(f'### 文本清洗{len(cleaned_docs)}个')
+                    # 文本清洗
+                    print('文本清洗')
+                    cleaned_docs = self.clean_text(raw_docs)
+                    print(f'### 文本清洗{len(cleaned_docs)}个')
 
-                # 窗口拼接
-                print('窗口拼接')
-                window_contexts = self.text_window_retrieval(cleaned_docs)
-                print(f'### 窗口拼接{len(window_contexts)}个')
+                    # 窗口拼接
+                    print('窗口拼接')
+                    window_contexts = self.text_window_retrieval(cleaned_docs)
+                    print(f'### 窗口拼接{len(window_contexts)}个')
 
-                # 文本拼接
-                print('文本拼接')
-                text_contexts = await self.text_pitch_async(window_contexts)
-                print(f'### 文本拼接{len(text_contexts)}个')
+                    # 文本拼接
+                    print('文本拼接')
+                    text_contexts = await self.text_pitch_async(window_contexts)
+                    print(f'### 文本拼接{len(text_contexts)}个')
 
-                # 文本分块
-                print('文本分块')
-                new_contents = await self.text_chunk_splitter_async(text_contexts)
-                print(f'### 文本分块完成，共{len(new_contents)}个')
+                    # 文本分块
+                    print('文本分块')
+                    new_contents = await self.text_chunk_splitter_async(text_contexts)
+                    print(f'### 文本分块完成，共{len(new_contents)}个')
 
-            elif file_type == "table":
-                # 3.2 表格文件处理
+                elif file_type == "table":
+                    # 3.2 表格文件处理
 
-                # 表格分块
-                pass
-            elif file_type == "audio":
-                # 3.3 音频文件处理
-                
-                # 文本纠偏
+                    # 表格分块
+                    pass
+                elif file_type == "audio":
+                    # 3.3 音频文件处理
+                    auido_to_text = self.audio_to_text(file_path)
+                    
+                    # 文本纠偏
+                    correction_contents = await self.text_correction_handler_async([auido_to_text])
 
-                # 文本分块
-                pass
-            elif file_type == "image":
-                # 3.4 图像文件处理
+                    # 文本分块
+                    new_contents = await self.text_chunk_splitter_async(correction_contents)
+                    pass
+                elif file_type == "image":
+                    # 3.4 图像文件处理
 
-                # 图像向量化
+                    # 图像向量化
 
-                # 图像描述
-                pass
-            elif file_type == 'question-answer':
-                pass
-            else:
-                raise ValueError(f'不支持的文件类型：{file_type}')
+                    # 图像描述
+                    pass
+                elif file_type == 'question-answer':
+                    pass
+                else:
+                    raise ValueError(f'不支持的文件类型：{file_type}')
 
-            # 4. 文本处理
-            print('文本处理')
-            processed_contents = await self.text_processor_async(new_contents)
+                # 4. 文本处理
+                print('文本处理')
+                processed_contents = await self.text_processor_async(new_contents)
 
-            # 5. 入库信息生成
-            print('入库信息生成')
-            records_to_save = self.save_knowledge_data_generator(processed_contents, metadata_dict, image_embeddings)
+                # 5. 入库信息生成
+                print('入库信息生成')
+                records_to_save = self.save_knowledge_data_generator(processed_contents, metadata_dict, image_embeddings)
+                print(records_to_save)
 
-            # 6. 信息入库
-            print('信息入库')
-            successful_insert_info = await asyncio.to_thread(self.save_to_vector_database, records_to_save)
+                # 6. 信息入库
+                print('信息入库')
+                # successful_insert_info = await asyncio.to_thread(self.save_to_vector_database, records_to_save)
 
-            print(f"文件处理成功: {file_path}")
-            return {"status": "success", "file_path": file_path}
-        except Exception as e:
-            print(f"文件处理失败: {file_path}, 错误: {e}")
-            return {"status": "failed", "file_path": file_path, "error": str(e)}      
+                print(f"文件处理成功: {file_path}")
+                return {"status": "success", "file_path": file_path}
+            except Exception as e:
+                print(f"文件处理失败: {file_path}, 错误: {e}")
+                return {"status": "failed", "file_path": file_path, "error": str(e)}      
         
     async def file_to_knowledge_database_handler_async(self, file_paths: List[str], metadata: List[dict] = None):
         """
@@ -725,8 +963,11 @@ class RAGTool:
         if metadata is None:
             metadata = [None] * len(file_paths)
 
+        # 限制并发数量
+        semaphore = asyncio.Semaphore(self.concurrency_limit)
+
         # 创建协程任务
-        tasks = [asyncio.create_task(self.file_to_knowledge_database_async(path, meta)) for path, meta in zip(file_paths, metadata)]
+        tasks = [asyncio.create_task(self.file_to_knowledge_database_async(path, meta, semaphore)) for path, meta in zip(file_paths, metadata)]
 
         # 执行任务
         results = await asyncio.gather(*tasks)
@@ -743,7 +984,6 @@ class RAGTool:
         将聊天记录存入向量数据库
         """
         pass
-
 
     async def search_knowledge_database(self, request: str, limit_search_num: int=50,  limit_output_nun: int = 5, return_metadata: List[str]=None):
         """
@@ -766,9 +1006,9 @@ class RAGTool:
         ]
 
         # 模型交互
-        response = await self.async_client.chat(model=config.get_setting("models")["generative_model_name"], 
+        response = await self.async_client.chat(model=self.generative_model_name, 
                                                 messages=message,
-                                                options=config.get_setting("models")["ollama_model_option"])
+                                                options=self.ollama_model_option)
 
         # 提取输出json
         answer_summary = json_extractor(response['message']['content'])
@@ -807,7 +1047,7 @@ class RAGTool:
         return response
 
 if __name__ == '__main__':
-    file_paths = ['data/Documents/2025数据分析Agent实践与案例研究报告.pdf']
+    file_paths = ['data/Audios/vad_example.wav']
     test_tool = RAGTool()
 
     # 检查和加载模型

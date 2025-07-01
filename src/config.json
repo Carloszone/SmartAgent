@@ -3,16 +3,17 @@
         "document_directory": "/data/Documents"
     },
     "models":{
-        "generative_model_name": "qwen3:32b",
+        "generative_model_name": "qwen3:8b",
         "text_embedding_model_name": "bge-m3:567m",
-        "audio_model_name_1": "funasr/paraformer-zh",
-        "audio_model_name_2": "FunAudioLLM/SenseVoiceSmall",
+        "audio_model_address_1": "models/FunsarParaformer-zh",
+        "audio_model_address_2": "models/SenseVoice",
+        "audio_vad_model_address": "models/Fsmn-vad",
         "image_embedding_model_name": "qwen2.5vl:7b",
         "ollama_model_option": {"temperature": 0}
 
     },
     "file_types":{
-        "text_file_extension": [".txt", ".pdf", ".docx"],
+        "text_file_extension": [".txt", ".pdf", ".docx", ".md"],
         "table_file_extension": [".csv", ".xlsx", ".xls"],
         "audio_file_extension": [".wav"],
         "image_file_extension": [".png", ".jpg"]
@@ -23,5 +24,9 @@
         "grpc_port": 50051,
         "knewledge_base_collection_name": "knowledge_base_collection",
         "chat_collection_name": "chat_history_collection"
+    },
+    "other": {
+        "model_retry_num": 3,
+        "concurrency_limit": 4
     }
 }
