@@ -1,15 +1,14 @@
-from langchain_community.document_loaders import PyMuPDFLoader, TextLoader, UnstructuredWordDocumentLoader, UnstructuredPDFLoader
+# 目前没有合适的中文图文embedding模型，因此对图片的处理模式为：描述图片->描述文本embedding 所以不支持以图搜图
+
 from ConfigManager import config
 import os
 import re
-from typing import List, Union
+from typing import List, Union, Optional
 from langchain_core.documents import Document
-from ContentHandler import get_system_message, json_extractor, apply_rrf
+from src.ContentHandler import get_system_message, json_extractor, apply_rrf, find_html_tables_in_markdown, find_files_in_directory, get_context_around_image, file_loader
+from src.ContentHandler import html_to_json
 import weaviate
-import weaviate.classes as wvc
-import json
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from weaviate.classes.query import Filter, MetadataQuery
 from weaviate.util import generate_uuid5
 import pandas as pd
@@ -20,7 +19,8 @@ from funasr.utils.postprocess_utils import rich_transcription_postprocess
 import tqdm
 import markdown
 from bs4 import BeautifulSoup
-
+import shutil
+from src.FileLoaders import image_text_reader
 
 
 class RAGTool:
@@ -36,7 +36,7 @@ class RAGTool:
         self.text_embedding_model_name = config.get_setting("models")["text_embedding_model_name"]  # 文本embedding模型
         self.audio_model_address = config.get_setting("models")["audio_model_address_1"]  # 音频模型的地址
         self.audio_vad_model_address = config.get_setting("models")["audio_vad_model_address"]  # 音频ad模型地址
-        self.image_embedding_model_name = config.get_setting("models")["image_embedding_model_name"]  #  图像embedding模型
+        self.image_caption_model_name = config.get_setting("models")["image_caption_model_name"]  #  图像描述模型
         self.ollama_model_option = config.get_setting("models")["ollama_model_option"]  # ollama模型额外参数
 
 
@@ -49,17 +49,15 @@ class RAGTool:
         self.chat_collection_name = config.get_setting("vector_database")["chat_collection_name"]  # 聊天记录collection的名称
         
 
-        # 文档类型相关
-        self.document_types = config.get_setting("file_types")["text_file_extension"]  # 文档后缀
-        self.table_types = config.get_setting("file_types")["table_file_extension"]  # 表格后缀
-        self.audio_types = config.get_setting("file_types")["audio_file_extension"]  # 音频后缀
-        self.image_types = config.get_setting("file_types")["image_file_extension"]  # 图像后缀
+        # 文档相关
+        self.document_types = config.get_setting("file")["types"]["text_file_extension"]  # 文档后缀
+        self.table_types = config.get_setting("file")["types"]["table_file_extension"]  # 表格后缀
+        self.audio_types = config.get_setting("file")["types"]["audio_file_extension"]  # 音频后缀
+        self.image_types = config.get_setting("file")["types"]["image_file_extension"]  # 图像后缀
+        self.default_file_access_level = config.get_setting("file")["default_file_access_level"]
 
-        self.file_loader_mapping = {
-            ".pdf": UnstructuredPDFLoader,
-            ".docx": UnstructuredWordDocumentLoader,
-            ".txt": TextLoader
-        }
+        # 输出相关
+        self.output_dir = config.get_setting("output_dir")
 
         # 其他参数：
         self.model_retry_num = 3  # 遇到模型报错时的重试次数
@@ -157,30 +155,6 @@ class RAGTool:
                 return "image"
             else:
                 raise ValueError(f'不支持的文件格式:{file_extension}')
-
-    def file_reader(self, file_path) -> List:
-        """
-        用于读取导入的文档的函数
-        """
-        # 获取文件后缀
-        file_extension = os.path.splitext(file_path)[1].lower()
-
-        # 进行后缀匹配
-        if file_extension in self.file_loader_mapping:
-            document_loader = self.file_loader_mapping.get(file_extension)
-
-            # 基于后缀，创建loader实例
-            if file_extension in self.file_loader_mapping.keys():
-                loader = document_loader(file_path)
-            else:
-                loader = document_loader(file_path, encoding='utf-8')
-
-            # 加载并返回文档内容
-            return loader.load()
-        else:
-            print(f"警告：不支持的文件类型 {file_extension}，跳过文件 {file_path}")
-            loader
-            return []
 
     def text_clear_formatting(self, docs:List[Document], metadata_dicts: List[dict]) -> List[Document]:
         """
@@ -629,40 +603,6 @@ class RAGTool:
                 data_dict[uuid]["content_vector"] = image_embeddings
         return data_dict
 
-    async def audio_to_text_async(self, audio_path: str, meta: dict) -> Document:
-            """
-            对音频文件进行语音识别的函数
-            """
-            try:
-                res = self.audio_model_1.generate(
-                    input=audio_path, 
-                    cache={},
-                    language="auto",  # "zn", "en", "yue", "ja", "ko", "nospeech"
-                    use_itn=True,
-                    batch_size_s=60,
-                    merge_vad=True, 
-                    merge_length_s=15,
-                )
-                text = rich_transcription_postprocess(res[0]["text"])
-            except:
-                text = ""
-
-            # 结果输出
-            content = Document(page_content=text, metadata=meta)
-            return {'content': content}
-    
-    async def audio_to_text_handler_async(self, audio_paths: List[str], metas: List[dict]) -> List[Document]:
-        """
-        异步音频读取函数
-        """
-        # 任务生成与执行
-        tasks = [self.audio_to_text_async(path, meta) for path, meta in zip(audio_paths, metas)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # 结果筛选
-        output_results = [result for result in results if isinstance(result, Document)]
-        return output_results
-
     async def text_correction_async(self, text_dict: dict) -> Document:
         """
         对音频识别的结果进行纠偏处理
@@ -726,10 +666,135 @@ class RAGTool:
         output_results = [result for result in results if isinstance(result, Document)]
         return output_results
     
+    async def table_content_description_async(self, table_content: dict):
+        """
+        对JSON化的表格内容进行描述
+        """
+        # 构建message
+        system_message = get_system_message('table_description')
+        message = [
+            {
+                "role": "system",
+                "content": system_message
+            },
+            {
+                "role": "user",
+                "content": f"请对以下文本进行概括总结：{table_content}" 
+            }
+        ]
+
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
+ 
+        # 提取输出json
+        try:
+            output_content = json_extractor(response['message']['content'])
+            return output_content
+        except Exception as e:
+            return e
+
+    async def image_caption_async(self, image_path):
+        # 构建图片描述信息
+        system_message = get_system_message('image_caption')
+        message = [
+            {
+                "role": "system",
+                "content": system_message
+            },
+            {
+                "role": "user",
+                "content": "请尽可能详尽地描述传入的图片",
+                "images": [{image_path}]
+            }
+        ]
+
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
+ 
+        # 提取输出json
+        try:
+            output_content = json_extractor(response['message']['image_caption'])
+            return output_content
+        except Exception as e:
+            return e
+
+    async def image_description_fusion_async(self, image_description:str, image_content: str, image_text: str):
+        """
+        基于图片的描述信息，文字信息和上下文，概括图片的内容
+        """
+        # 构建message
+        system_message = get_system_message('image_description')
+        message = [
+            {
+                "role": "system",
+                "content": system_message
+            },
+            {
+                "role": "user",
+                "content": f"请结合以下信息，综合概括图片描述的内容。模型识别出的图片内容{image_description}, 图像的上下文的文本内容{image_content}, 图像里的文字内容{image_text}" 
+            }
+        ]
+
+        # 模型交互,针对503错误重试
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
+ 
+        # 提取输出json
+        try:
+            output_content = json_extractor(response['message']['description'])
+            return output_content
+        except Exception as e:
+            return e
+        
 
     ###################################################### 整合函数  ######################################################
     async def text_pipeline_async(self, 
-                                  text_contents: List, 
+                                  file_info: Optional[dict] = None,
+                                  text_doc: Optional[Document] = None, 
                                   do_text_clean: bool=True, 
                                   do_text_correction: bool=False,
                                   do_text_fusion: bool=False,
@@ -738,8 +803,18 @@ class RAGTool:
         """
         文本处理流水线函数
         """
+        if file_info:
+            # 读取文件，生成document对象 
+            text_path = file_info['element_path']
+            text_doc = self.file_reader(text_path)
+
+            # 更新元数据信息
+            text_doc.metadata["source"] = file_info.get("source", "")
+            text_doc.metadata["file_type"] = file_info.get("file_type", "")
+            text_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
+
         # 文本去格式化(markdown转text)
-        processed_contents = self.text_clear_formatting(text_contents)
+        processed_contents = self.text_clear_formatting([text_doc])
 
         # 文本清洗
         if do_text_clean:
@@ -764,40 +839,88 @@ class RAGTool:
         #返回结果
         return processed_contents
 
-
-    async def audio_pipeline(self, audio_paths: List[str], meta_dicts=List[dict]) -> List[dict]:
+    async def table_pipeline_async(self, file_info: dict) -> List[dict]:
         """
-        音频处理管道函数
+        表格文件/对象的处理管道
         """
-        # 音频识别
-        text_contents = await self.audio_to_text_handler_async(audio_paths=audio_paths, metas=meta_dicts)
+        table_path = file_info.get("element_path", None)
+        if table_path:
+            table_text = self.file_reader(table_path)
+        else:
+            table_text = file_info["element_content"]
 
-        # 文本处理
-        processed_content = await self.text_pipeline(text_contents=text_contents)
+        # 表格内容转json
+        table_json = html_to_json(table_text)
 
-        return processed_content
+        # 表格内容提炼:当行数大于20时,视为非文本表格
+        if len(table_json) >= 20:
+            raise ValueError(f'暂不支持大表格处理')
+        else:
+            # 大模型提取信息
+            table_description = await self.table_content_description_async(table_json)
+        
+        # 更新元数据信息
+        table_doc = Document(page_content=table_description, metadata={})
+        table_doc.metadata["source"] = file_info.get("source", "")
+        table_doc.metadata["file_type"] = file_info.get("file_type", "")
+        table_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
 
-    async def image_pipeline(self, image_paths: List, meta_dict: list[dict]) -> List[dict]:
+        # 表格元素处理
+        processed_contents = await self.text_pipeline_async(text_doc=table_doc, do_text_chunk=False)
+        return processed_contents
+
+    async def audio_pipeline_async(self, file_info: dict) -> List[dict]:
+        """
+        音频文件的处理管道
+        """
+        audio_path = file_info['element_path']
+        audio_doc = await self.audio_to_text_handler_async(audio_paths=audio_path)
+
+        # 更新元数据信息
+        audio_doc.metadata["source"] = file_info.get("source", "")
+        audio_doc.metadata["file_type"] = file_info.get("file_type", "")
+        audio_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
+        
+        # 音频文本处理
+        processed_contents = await self.text_pipeline_async(text_doc=audio_doc)
+        return processed_contents
+
+    async def image_pipeline_async(self, file_info:dict):
         """
         图像处理管道函数
         """
-        # 图像文本识别
+        # 信息提取
+        image_path = file_info.get("element_path", None)
+        image_content = file_info.get("element_content", "")
 
-        # 图像描述
+        # 生成图片描述
+        image_description = await self.image_caption_async(image_path=image_path)
 
-        # 文本信息整合
+        # 识别图片的文字内容
+        image_text = image_text_reader(image_path)
+            
+        # 拼接图像文本
+        if len(image_content) == 0:  # 无法找到图像的上下文
+            pass
+        else:
+            all_image_text = f"图片的描述内容为：{image_description}, 图片内文字内容为：{image_text}, 图片所在上下文内容为：{image_content}"
 
-        # 文本处理
+        # 综合生成图片描述
+        image_description_fusion = await self.image_description_fusion_async(image_description=image_description,
+                                                                             image_content=image_content,
+                                                                             image_text=image_text)
 
-        # 图像嵌入向量生成
+        # 生成文本doc
+        image_doc = Document(page_content=image_description_fusion, metadata={})
 
-        # 整合结果
+        # 更新元数据信息
+        image_doc.metadata["source"] = file_info.get("source", "")
+        image_doc.metadata["file_type"] = file_info.get("file_type", "")
+        image_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
 
-        # 返回结果
-        pass
-
-
-
+        # 图像描述文本处理
+        processed_contents = await self.text_pipeline_async(text_doc=image_doc, do_text_chunk=False)
+        return processed_contents
 
     
     ###################################################### 工具/流程函数  ######################################################
@@ -816,8 +939,8 @@ class RAGTool:
             print(f'未找到ollama模型{self.generative_model_name},请检查')
         if self.text_embedding_model_name not in local_models:
             print(f'未找到ollama模型{self.text_embedding_model_name},请检查')
-        if self.image_embedding_model_name not in local_models:
-            print(f'未找到ollama模型{self.image_embedding_model_name},请检查')
+        if self.image_caption_model_name not in local_models:
+            print(f'未找到ollama模型{self.image_caption_model_name},请检查')
 
         # 加载音频识别函数
         audio_model_name = self.audio_model_address
@@ -869,85 +992,81 @@ class RAGTool:
         if self.vector_database_client:
             self.vector_database_client.close()
 
-    async def file_to_knowledge_database_async(self, file_path: str, metadata_dict: dict, semaphore: asyncio.Semaphore):
+    async def file_to_knowledge_database_async(self, 
+                                               file_path: str, 
+                                               metadata_dict: dict, 
+                                               semaphore: asyncio.Semaphore):
         """
         负责单个文件的ETF流程。这个函数内部包含了所有的异步和批量操作
         """
         async with semaphore:
+            image_embeddings = None  # 图像embeddings初始化
+            temp_dir_path = None  # 初始化临时保存地址
             try:
                 # 1. 识别文件类型
                 print('识别文件类型')
                 file_type = self.file_type_identifier(file_path)
 
-                # 2 依据文件类型进行处理
+            
+                # 2 基于文件类型，提取其中的元素信息
                 print(f'当前文件的类型是：{file_type}')
-                image_embeddings = None
-                if file_type == "text":
-                    # 3.1 文本文件处理
-                    # 读取文件
-                    print('读取文件')
-                    raw_docs = self.file_reader(file_path)
-                    print(f'### 读取文件{len(raw_docs)}个')
+                if file_type == 'document':
+                    # 文件解析
+                    element_list = []
+                    parse_result = file_loader([file_path], self.output_dir)
+                    formatted_text_path = parse_result.get("text_path")
+                    image_dir = parse_result.get("image_path")
+                    temp_dir_path = parse_result.get("temp_dir_path")
+                    element_list.append({"element_path": formatted_text_path, "element_type": "text", "source": file_path, "file_type": file_type} | metadata_dict)  # 组织元素信息并添加元数据信息
 
-                    # 文本清洗
-                    print('文本清洗')
-                    cleaned_docs = self.clean_text(raw_docs)
-                    print(f'### 文本清洗{len(cleaned_docs)}个')
+                    # 表格提取
+                    table_list = find_html_tables_in_markdown(file_path=formatted_text_path)
+                    for table_content in table_list:
+                        element_list.append({"element_type": "table", "element_content": table_content, "source": file_path, "file_type": file_type} | metadata_dict)
 
-                    # 窗口拼接
-                    print('窗口拼接')
-                    window_contexts = self.text_window_retrieval(cleaned_docs)
-                    print(f'### 窗口拼接{len(window_contexts)}个')
-
-                    # 文本拼接
-                    print('文本拼接')
-                    text_contexts = await self.text_pitch_async(window_contexts)
-                    print(f'### 文本拼接{len(text_contexts)}个')
-
-                    # 文本分块
-                    print('文本分块')
-                    new_contents = await self.text_chunk_splitter_async(text_contexts)
-                    print(f'### 文本分块完成，共{len(new_contents)}个')
-
-                elif file_type == "table":
-                    # 3.2 表格文件处理
-
-                    # 表格分块
-                    pass
-                elif file_type == "audio":
-                    # 3.3 音频文件处理
-                    auido_to_text = self.audio_to_text(file_path)
-                    
-                    # 文本纠偏
-                    correction_contents = await self.text_correction_handler_async([auido_to_text])
-
-                    # 文本分块
-                    new_contents = await self.text_chunk_splitter_async(correction_contents)
-                    pass
-                elif file_type == "image":
-                    # 3.4 图像文件处理
-
-                    # 图像向量化
-
-                    # 图像描述
-                    pass
-                elif file_type == 'question-answer':
-                    pass
+                    # 图像内容提取
+                    full_image_paths = find_files_in_directory(image_dir, target_extension="jpg")  # 遍历寻找所有jpg图像文件
+                    for full_image_path in full_image_paths:
+                        # 提取图像文件名
+                        file_name_format = r'[^/\\]+$'
+                        image_name = re.search(file_name_format, full_image_path).group(0)
+                        image_content = get_context_around_image(file_path=formatted_text_path, image_name=image_name)
+                        element_list.append({
+                            "element_path": full_image_path,
+                            "element_type": "image",
+                            "element_content": image_content,
+                            "source": file_path, "file_type": file_type} | metadata_dict)
                 else:
-                    raise ValueError(f'不支持的文件类型：{file_type}')
+                    # 读取文件
+                    element_list = [{"element_path": file_path, "element_type": file_type, "source": file_path, "file_type": file_type} | metadata_dict]
 
-                # 4. 文本处理
-                print('文本处理')
-                processed_contents = await self.text_processor_async(new_contents)
+                # 3 基于元素类型进行分流处理
+                for element_info in element_list:
+                    element_type = element_info["element_type"]
+                    print(f'当前文档元素的类型为:{element_type}')
+                    if element_type == "text":  # 3.1 文本处理
+                        processed_contents = await self.text_pipeline_async(file_info=element_info)
+                    elif element_type == "table":  # 3.2 表格文件处理
+                        processed_contents = await self.table_pipeline_async(table_content=[element_info])
+                    elif element_type == "audio": # 3.3 音频文件处理
+                        processed_contents = await self.audio_pipeline_async(file_info=element_info)
+                    elif element_type == "image":  # 3.4 图像文件处理
+                        processed_contents, image_embeddings = await self.image_pipeline_async(file_info=element_info)
+                    else:
+                        raise ValueError(f'不支持的文件类型：{file_type}')
 
-                # 5. 入库信息生成
-                print('入库信息生成')
-                records_to_save = self.save_knowledge_data_generator(processed_contents, metadata_dict, image_embeddings)
-                print(records_to_save)
+                    # 入库信息生成
+                    print('入库信息生成')
+                    records_to_save = self.save_knowledge_data_generator(processed_contents, image_embeddings)
+                    print(records_to_save)
 
-                # 6. 信息入库
-                print('信息入库')
-                # successful_insert_info = await asyncio.to_thread(self.save_to_vector_database, records_to_save)
+                    # 6. 信息入库
+                    print('信息入库')
+                    # successful_insert_info = await asyncio.to_thread(self.save_to_vector_database, records_to_save)
+
+                # 删除临时文件和文件夹
+                if temp_dir_path:
+                    shutil.rmtree(temp_dir_path)
 
                 print(f"文件处理成功: {file_path}")
                 return {"status": "success", "file_path": file_path}
@@ -957,7 +1076,7 @@ class RAGTool:
         
     async def file_to_knowledge_database_handler_async(self, file_paths: List[str], metadata: List[dict] = None):
         """
-        文档处理函数,将传入的文档格式化，分块，提炼并embeding化存入向量数据库
+        文件处理函数,将传入的文件处理后存入向量数据库
         """
         # 元数据处理
         if metadata is None:
@@ -973,17 +1092,17 @@ class RAGTool:
         results = await asyncio.gather(*tasks)
         return results
 
-    async def chat_to_vector_database_handler_async(self, user_request: str, answer: str, metadata_dict: dict):
-        """
-        负责单个请求-问答对的数据库入库流程。这个函数内部包含了所有的异步和批量操作(异步处理)
-        """
-        pass       
+    # async def chat_to_vector_database_handler_async(self, user_request: str, answer: str, metadata_dict: dict):
+    #     """
+    #     负责单个请求-问答对的数据库入库流程。这个函数内部包含了所有的异步和批量操作(异步处理)
+    #     """
+    #     pass       
 
-    def chat_to_vector_database_handler(self, user_requests, answers,  metadata: List[dict] = None):
-        """
-        将聊天记录存入向量数据库
-        """
-        pass
+    # def chat_to_vector_database_handler(self, user_requests, answers,  metadata: List[dict] = None):
+    #     """
+    #     将聊天记录存入向量数据库
+    #     """
+    #     pass
 
     async def search_knowledge_database(self, request: str, limit_search_num: int=50,  limit_output_nun: int = 5, return_metadata: List[str]=None):
         """

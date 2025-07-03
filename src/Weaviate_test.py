@@ -51,8 +51,14 @@ try:
             index_filterable=True
         ),
         Property(
-            name="document_type",
-            description="文档类型 (e.g., PDF, DOCX, MD)",
+            name="file_type",
+            description="原始文件的类型 (e.g., pdf, docx, md)",
+            data_type=DataType.TEXT,
+            index_filterable=True
+        ),
+        Property(
+            name="chunk_type",
+            description="内容块的类型 (e.g., pdf, docx, md)",
             data_type=DataType.TEXT,
             index_filterable=True
         ),
@@ -62,15 +68,15 @@ try:
             data_type=DataType.INT,
             index_filterable=True
         ),
-        Property(
-            name="page_number",
-            description="在原始文件中的页码",
-            data_type=DataType.INT,
-            index_filterable=True
-        ),
+        # Property(
+        #     name="page_number",
+        #     description="在原始文件中的页码",
+        #     data_type=DataType.INT,
+        #     index_filterable=True
+        # ),
         Property(
             name="chunk_seq_id",
-            description="文本块在其所属文本中的序列ID",
+            description="内容块的序列ID",
             data_type=DataType.INT,
             index_filterable=True
         ),

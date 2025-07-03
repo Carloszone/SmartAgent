@@ -3,23 +3,30 @@ from jinja2 import Environment, FileSystemLoader
 import json
 import re
 import textwrap
-from typing import List
+from typing import List, Optional
 import numpy as np
-import copy
-from pathlib import Path
-import uuid
-from loguru import logger
+from langchain_community.document_loaders import TextLoader
+from FileLoaders import pdf_loader, docx_Loader
+from bs4 import BeautifulSoup
 
-from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn
-from mineru.data.data_reader_writer import FileBasedDataWriter
-from mineru.utils.draw_bbox import draw_layout_bbox, draw_span_bbox
-from mineru.utils.enum_class import MakeMode
-from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
-from mineru.backend.pipeline.pipeline_analyze import doc_analyze as pipeline_doc_analyze
-from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
-from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
-from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union_make
-from mineru.utils.models_download_utils import auto_download_and_get_model_root_path
+
+file_loader_mapping = {
+            # 文档对象
+            ".pdf": pdf_loader,
+            ".docx": docx_Loader,
+            ".txt": TextLoader,
+            ".md": TextLoader,
+            ".ppt": "",
+
+            # 表格对象
+            ".csv": "",
+            ".xls": "",
+
+            # 图片对象
+            ".jpg": "",
+            ".png": ""
+        }
+
 
 def get_system_message(mode: str):
     """
@@ -47,8 +54,14 @@ def get_system_message(mode: str):
         template = jinja2_env.get_template("TopicExtractionTemplate.jinja2")
     elif mode == "answer_summary":  # 回答摘要模板
         template = jinja2_env.get_template("AnswerSummaryTemplate.jinja2")
-    elif mode == "text_correction":
+    elif mode == "text_correction":  # 文本纠偏模板
         template = jinja2_env.get_template("AudioTextCorrection.jinja2")
+    elif mode == "table_description":  # 表格描述模板
+        template = jinja2_env.get_template("TableSummaryTemplate.jinja2")
+    elif mode == "image_description":  # 图片描述融合模板
+        template = jinja2_env.get_template("ImageDescriptionTemplate.jinja2")
+    elif mode == "image_caption":  # 图片内容捕捉模板
+        template = jinja2_env.get_template("ImageCaptionTemplate.jinja2")
     else:
         raise ValueError(f'mode参数错误，当前参数为{mode}')
     message = textwrap.dedent(template.render())
@@ -102,11 +115,148 @@ def json_extractor(content: str):
     raise ValueError(f"无法从输入中提取JSON数据,当前的输入信息为：{content}")
 
 
-def query_result_handler(result):
-    output_dcit = {}
-    for i, object in enumerate(result.objects):
-        uuid = object["uuid"]
-        output_dcit[str(uuid)] = i
+def find_files_in_directory(directory_path: str, target_extension: Optional[str] = None) -> List:
+    """
+    检查指定的文件夹中是否有文件。
+
+    参数:
+    directory_path (str): 要检查的文件夹路径。
+
+    返回:
+    list: 如果文件夹中存在文件，则返回包含所有文件完整路径的列表。
+    None: 如果文件夹不存在、不是一个有效的目录，或者文件夹为空（没有任何文件）。
+    """
+    # 检查路径是否存在以及是否是一个目录
+    if not os.path.isdir(directory_path):
+        print(f"错误：提供的路径 '{directory_path}' 不是一个有效的目录或不存在。")
+        return None
+
+    # 获取目录下的所有条目
+    all_entries = os.listdir(directory_path)
+
+    # 后缀预处理
+    if target_extension:
+    # 确保后缀以点开头
+        if not target_extension.startswith('.'):
+            target_extension = '.' + target_extension
+        # 将后缀转为小写，以进行不区分大小写的比较
+        target_extension = target_extension.lower()
+    
+    # 构建所有条目的完整路径，并筛选出文件
+    found_files = []
+    try:
+        # 3. 遍历目录下的所有条目
+        for entry_name in all_entries:
+            full_path = os.path.join(directory_path, entry_name)
+        
+            # 检查当前条目是否为文件
+            if os.path.isfile(full_path):
+            # 4. 如果指定了后缀，则进行筛选
+                if target_extension:
+                    # 使用 .lower() 来进行不区分大小写的后缀名比较
+                    if entry_name.lower().endswith(target_extension):
+                        found_files.append(full_path)
+            else:
+                # 如果没有指定后缀，则添加所有文件
+                found_files.append(full_path)
+
+        return found_files
+    except OSError as e:
+        print(f"访问目录时发生错误: {e}")
+    return []
+
+
+def get_context_around_image(file_path: str, image_name: str, num_paragraphs: int = 2) -> str:
+    """
+    从 Markdown 文件中截取包含特定图片行的上下文段落。
+
+    Args:
+        file_path (str): .md 文件的路径。
+        image_name (str): 要查找的图片文件名 (例如 '68a06be6...jpg')。
+        num_paragraphs (int, optional): 上下文要包含的段落数 (N)。默认为 2。
+
+    Returns:
+        str: 包含上下文的文本字符串。如果找不到文件或图片，则返回错误信息。
+    """
+    # 1. 读取文件内容
+    if not os.path.exists(file_path):
+        return f"错误：文件不存在 -> {file_path}"
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 2. 定义“段落”：使用正则表达式按一个或多个空行分割文本
+    #    这种方法比简单的 split('\n\n') 更健壮
+    paragraphs = re.split(r'\n\s*\n', content)
+    
+    # 清理可能因分割产生的空白段落
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+
+    # 3. 查找包含目标图片名的段落索引
+    target_index = -1
+    for i, p in enumerate(paragraphs):
+        if image_name in p:
+            target_index = i
+            break
+
+    if target_index == -1:
+        print(f'警告：在文档中未找到图片 -> {image_name}')
+        return ""
+
+    # 4. 计算上下文的起止索引
+    #    使用 max(0, ...) 来处理前面段落不足 N 个的情况
+    start_index = max(0, target_index - num_paragraphs)
+    
+    # 结束索引。Python 的切片是右开区间，所以 +1
+    end_index = target_index + num_paragraphs + 1
+
+    # 5. 提取上下文段落（Python 的列表切片会自动处理末尾越界的情况）
+    context_paragraphs = paragraphs[start_index:end_index]
+
+    # 6. 将提取的段落重新组合成一个字符串并返回
+    return '\n\n'.join(context_paragraphs)
+
+
+def find_html_tables_in_markdown(file_path: str) -> List[str]:
+    """
+    在指定的Markdown文件中查找所有嵌入的HTML表格块。
+
+    表格的格式必须是 "<html><body><table>...</table></body></html>"。
+
+    Args:
+        file_path (str): 要搜索的 .md 文件的路径。
+
+    Returns:
+        List[str]: 一个列表，其中每个元素都是一个找到的完整HTML表格字符串。
+                   如果文件不存在或未找到表格，则返回空列表。
+    """
+    # 检查文件是否存在，避免程序因找不到文件而崩溃
+    if not os.path.exists(file_path):
+        print(f"警告：文件不存在 -> {file_path}")
+        return []
+
+    try:
+        # 使用 'with' 语句安全地读取文件内容
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"读取文件时发生错误: {e}")
+        return []
+
+    # 定义正则表达式模式来匹配整个HTML表格块
+    # - r'...' 表示这是一个原始字符串，可以避免反斜杠问题
+    # - <html><body><table> 和 </table></body></html> 是字面匹配的起始和结束标记
+    # - .*? 是核心部分：
+    #   - .  匹配除换行符以外的任何字符
+    #   - * 匹配前面的字符零次或多次
+    #   - ?  使匹配变为“非贪婪模式”，即匹配尽可能少的字符，确保在有多个表格时，它会在第一个 "</table>" 处停止，而不是匹配到最后一个
+    # - re.DOTALL 标志是一个关键，它允许 '.' 匹配包括换行符在内的所有字符，因为表格HTML会跨越多行
+    pattern = r'<html><body><table>.*?</table></body></html>'
+    
+    # 使用 re.findall 找到所有不重叠的匹配项，并以列表形式返回
+    found_tables = re.findall(pattern, content, re.DOTALL)
+    
+    return found_tables
 
 
 def apply_rrf(search_results: List, k:int = 60) -> dict:
@@ -143,228 +293,71 @@ def apply_rrf(search_results: List, k:int = 60) -> dict:
     return sorted_uuids
 
 
-def do_parse(
-    output_dir,  # Output directory for storing parsing results
-    pdf_file_names: list[str],  # List of PDF file names to be parsed
-    pdf_bytes_list: list[bytes],  # List of PDF bytes to be parsed
-    p_lang_list: list[str],  # List of languages for each PDF, default is 'ch' (Chinese)
-    backend="pipeline",  # The backend for parsing PDF, default is 'pipeline'
-    parse_method="auto",  # The method for parsing PDF, default is 'auto'
-    p_formula_enable=True,  # Enable formula parsing
-    p_table_enable=True,  # Enable table parsing
-    server_url=None,  # Server URL for vlm-sglang-client backend
-    f_draw_layout_bbox=False,  # Whether to draw layout bounding boxes
-    f_draw_span_bbox=False,  # Whether to draw span bounding boxes
-    f_dump_md=True,  # Whether to dump markdown files
-    f_dump_middle_json=False,  # Whether to dump middle JSON files
-    f_dump_model_output=False,  # Whether to dump model output files
-    f_dump_orig_pdf=False,  # Whether to dump original PDF files
-    f_dump_content_list=False,  # Whether to dump content list files
-    f_make_md_mode=MakeMode.MM_MD,  # The mode for making markdown content, default is MM_MD
-    start_page_id=0,  # Start page ID for parsing, default is 0
-    end_page_id=None,  # End page ID for parsing, default is None (parse all pages until the end of the document)
-):
-    # 生成uuid
-    time_based_id = str(uuid.uuid1())
+def html_to_json(html_content):
+    soup = BeautifulSoup(html_content, 'lxml')
+    is_table = soup.find('table')
 
-    if backend == "pipeline":
-        for idx, pdf_bytes in enumerate(pdf_bytes_list):
-            new_pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
-            pdf_bytes_list[idx] = new_pdf_bytes
+    table_data = []
+    if is_table:
+        rows = table.find_all('tr')
+        for row in rows:
+            cols = rows.find_all('td', 'th')
+            cols_text = [ele.text.strip() for ele in cols]
+            table_data.append(cols_text)
 
-        infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = pipeline_doc_analyze(pdf_bytes_list, p_lang_list, parse_method=parse_method, formula_enable=p_formula_enable,table_enable=p_table_enable)
+        original_json = json.dumps(table_data, indent=2, ensure_ascii=False)
 
-        for idx, model_list in enumerate(infer_results):
-            model_json = copy.deepcopy(model_list)
-            pdf_file_name = pdf_file_names[idx]
-            local_image_dir, local_md_dir = prepare_env(output_dir, time_based_id, parse_method)
-            image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        # 表格内容处理
+        table_headers = table_data[0]
+        table_rows = table_data[1:]
+        table_list = []
+        for row in table_rows:
+            obj = {table_headers[i]: (row[1] if i < len(row) else None) for i in range(len(table_headers))}
+            table_list.append(obj)
 
-            images_list = all_image_lists[idx]
-            pdf_doc = all_pdf_docs[idx]
-            _lang = lang_list[idx]
-            _ocr_enable = ocr_enabled_list[idx]
-            middle_json = pipeline_result_to_middle_json(model_list, images_list, pdf_doc, image_writer, _lang, _ocr_enable, p_formula_enable)
-
-            pdf_info = middle_json["pdf_info"]
-
-            pdf_bytes = pdf_bytes_list[idx]
-            if f_draw_layout_bbox:
-                draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
-
-            if f_draw_span_bbox:
-                draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
-
-            if f_dump_orig_pdf:
-                md_writer.write(
-                    f"{pdf_file_name}_origin.pdf",
-                    pdf_bytes,
-                )
-
-            if f_dump_md:
-                image_dir = str(os.path.basename(local_image_dir))
-                md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}.md",
-                    md_content_str,
-                )
-
-            if f_dump_content_list:
-                image_dir = str(os.path.basename(local_image_dir))
-                content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}_content_list.json",
-                    json.dumps(content_list, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_middle_json:
-                md_writer.write_string(
-                    f"{pdf_file_name}_middle.json",
-                    json.dumps(middle_json, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_model_output:
-                md_writer.write_string(
-                    f"{pdf_file_name}_model.json",
-                    json.dumps(model_json, ensure_ascii=False, indent=4),
-                )
-
-            logger.info(f"local output dir is {local_md_dir}")
-            return {'text_path': os.path.join(local_md_dir, f"{pdf_file_name}.md"),
-                    "image_path": local_image_dir}
+        table_json = json.dumps(table_list, indent=2, ensure_ascii=False)
+        
+        return original_json, table_json
     else:
-        if backend.startswith("vlm-"):
-            backend = backend[4:]
+        print('未能找到表格信息')
+        return ''
 
-        f_draw_span_bbox = False
-        parse_method = "vlm"
-        for idx, pdf_bytes in enumerate(pdf_bytes_list):
-            pdf_file_name = pdf_file_names[idx]
-            pdf_bytes = convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id, end_page_id)
-            local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-            image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
-            middle_json, infer_result = vlm_doc_analyze(pdf_bytes, image_writer=image_writer, backend=backend, server_url=server_url)
-
-            pdf_info = middle_json["pdf_info"]
-
-            if f_draw_layout_bbox:
-                draw_layout_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_layout.pdf")
-
-            if f_draw_span_bbox:
-                draw_span_bbox(pdf_info, pdf_bytes, local_md_dir, f"{pdf_file_name}_span.pdf")
-
-            if f_dump_orig_pdf:
-                md_writer.write(
-                    f"{pdf_file_name}_origin.pdf",
-                    pdf_bytes,
-                )
-
-            if f_dump_md:
-                image_dir = str(os.path.basename(local_image_dir))
-                md_content_str = vlm_union_make(pdf_info, f_make_md_mode, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}.md",
-                    md_content_str,
-                )
-
-            if f_dump_content_list:
-                image_dir = str(os.path.basename(local_image_dir))
-                content_list = vlm_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
-                md_writer.write_string(
-                    f"{pdf_file_name}_content_list.json",
-                    json.dumps(content_list, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_middle_json:
-                md_writer.write_string(
-                    f"{pdf_file_name}_middle.json",
-                    json.dumps(middle_json, ensure_ascii=False, indent=4),
-                )
-
-            if f_dump_model_output:
-                model_output = ("\n" + "-" * 50 + "\n").join(infer_result)
-                md_writer.write_string(
-                    f"{pdf_file_name}_model_output.txt",
-                    model_output,
-                )
-
-            logger.info(f"local output dir is {local_md_dir}")
-            return {'text_path': os.path.join(local_md_dir, f"{pdf_file_name}.md"),
-                    "image_path": local_image_dir}
-
-
-def parse_doc(
-        path_list: list[Path],
-        output_dir,
-        lang="ch",
-        backend="pipeline",
-        method="auto",
-        server_url=None,
-        start_page_id=0,  # Start page ID for parsing, default is 0
-        end_page_id=None  # End page ID for parsing, default is None (parse all pages until the end of the document)
-):
+def file_loader(file_path, output_dir: str) -> dict:
     """
-        Parameter description:
-        path_list: List of document paths to be parsed, can be PDF or image files.
-        output_dir: Output directory for storing parsing results.
-        lang: Language option, default is 'ch', optional values include['ch', 'ch_server', 'ch_lite', 'en', 'korean', 'japan', 'chinese_cht', 'ta', 'te', 'ka']。
-            Input the languages in the pdf (if known) to improve OCR accuracy.  Optional.
-            Adapted only for the case where the backend is set to "pipeline"
-        backend: the backend for parsing pdf:
-            pipeline: More general.
-            vlm-transformers: More general.
-            vlm-sglang-engine: Faster(engine).
-            vlm-sglang-client: Faster(client).
-            without method specified, pipeline will be used by default.
-        method: the method for parsing pdf:
-            auto: Automatically determine the method based on the file type.
-            txt: Use text extraction method.
-            ocr: Use OCR method for image-based PDFs.
-            Without method specified, 'auto' will be used by default.
-            Adapted only for the case where the backend is set to "pipeline".
-        server_url: When the backend is `sglang-client`, you need to specify the server_url, for example:`http://127.0.0.1:30000`
+    读取文件的读取器
+    目前支持的文件类型有：.pdf, .txt, .md
     """
-    try:
-        file_name_list = []
-        pdf_bytes_list = []
-        lang_list = []
-        for path in path_list:
-            file_name = str(Path(path).stem)
-            pdf_bytes = read_fn(path)
-            file_name_list.append(file_name)
-            pdf_bytes_list.append(pdf_bytes)
-            lang_list.append(lang)
-        extraction_info = do_parse(
-                output_dir=output_dir,
-                pdf_file_names=file_name_list,
-                pdf_bytes_list=pdf_bytes_list,
-                p_lang_list=lang_list,
-                backend=backend,
-                parse_method=method,
-                server_url=server_url,
-                start_page_id=start_page_id,
-                end_page_id=end_page_id
-            )
-        return extraction_info
-    except Exception as e:
-        logger.exception(e)
+
+    # 获取文件后缀
+    file_extension = os.path.splitext(file_path)[1].lower()
+
+    # 进行后缀匹配
+    if file_extension in file_loader_mapping:
+        document_loader = file_loader_mapping.get(file_extension)
+
+        # 基于后缀，创建loader实例
+        if file_extension in file_loader_mapping.keys():
+            file_info = document_loader(file_path, output_dir=output_dir)
+
+        # 加载并返回文档内容
+        return file_info
+    else:
+        print(f"警告：不支持的文件类型 {file_extension}，跳过文件 {file_path}")
+        return {}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 if __name__ == '__main__':
-    __dir__ = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(__dir__)
-    pdf_files_dir = os.path.join(__dir__, "pdfs")
-    output_dir = os.path.join(project_root, "output")
-    pdf_suffixes = [".pdf"]
-    image_suffixes = [".png", ".jpeg", ".jpg"]
-
-    doc_path_list = ['data/Documents/室内空气质量检测报告.pdf']
-    for doc_path in Path(pdf_files_dir).glob('*'):
-        if doc_path.suffix in pdf_suffixes + image_suffixes:
-            doc_path_list.append(doc_path)
-
-    """如果您由于网络问题无法下载模型，可以设置环境变量MINERU_MODEL_SOURCE为modelscope使用免代理仓库下载模型"""
-    # os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
-
-    """Use pipeline mode if your environment does not support VLM"""
-    result = parse_doc(doc_path_list, output_dir, backend="pipeline")
-    print(result)
+    res = get_context_around_image(file_path='output/Document.md', image_name="image_1.png")
+    print(res)
