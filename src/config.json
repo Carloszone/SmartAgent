@@ -1,8 +1,9 @@
 {
     "files":{
-        "document_directory": "/data/Documents",
-        "output_dir": "/output",
+        "document_directory": "./data/Documents",
+        "output_dir": "./output",
         "default_file_access_level": 0,
+        "long_text_threshold": 50,
         "types":{
         "text_file_extension": [".txt", ".pdf", ".docx", ".md"],
         "table_file_extension": [".csv", ".xlsx", ".xls"],

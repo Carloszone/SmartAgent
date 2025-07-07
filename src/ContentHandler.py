@@ -16,6 +16,7 @@ file_loader_mapping = {
             ".docx": docx_Loader,
             ".txt": TextLoader,
             ".md": TextLoader,
+            ".text": TextLoader,
             ".ppt": "",
 
             # 表格对象
@@ -40,7 +41,7 @@ def get_system_message(mode: str):
 
     if mode == 'markdown':  # markdown格式化模板
         template = jinja2_env.get_template('MarkdownTemplate.jinja2')
-    elif mode == 'content_pitch':  # 文本拼接模板
+    elif mode == 'text_fusion':  # 文本拼接模板
         template = jinja2_env.get_template("WindowPitchTemplate.jinja2")
     elif mode == "chunker":  # 文本分块模板
         template = jinja2_env.get_template("ChunkSplitterTemplate.jinja2")
@@ -113,7 +114,6 @@ def json_extractor(content: str):
         pass 
 
     raise ValueError(f"无法从输入中提取JSON数据,当前的输入信息为：{content}")
-
 
 def find_files_in_directory(directory_path: str, target_extension: Optional[str] = None) -> List:
     """
@@ -268,7 +268,7 @@ def apply_rrf(search_results: List, k:int = 60) -> dict:
     search_dict = {}
     for index, search_result in enumerate(search_results):
         search_dict[index] = {}
-        for ind, search_object in enumerate(search_result.object):
+        for ind, search_object in enumerate(search_result.objects):
             uuid = search_object.uuid
             all_uuids.append(uuid)
             search_dict[index][uuid] = ind + 1
@@ -299,9 +299,9 @@ def html_to_json(html_content):
 
     table_data = []
     if is_table:
-        rows = table.find_all('tr')
+        rows = is_table.find_all('tr')
         for row in rows:
-            cols = rows.find_all('td', 'th')
+            cols = row.find_all(['td', 'th'])
             cols_text = [ele.text.strip() for ele in cols]
             table_data.append(cols_text)
 
@@ -312,17 +312,17 @@ def html_to_json(html_content):
         table_rows = table_data[1:]
         table_list = []
         for row in table_rows:
-            obj = {table_headers[i]: (row[1] if i < len(row) else None) for i in range(len(table_headers))}
+            obj = {table_headers[i]: (row[i] if i < len(row) else None) for i in range(len(table_headers))}
             table_list.append(obj)
 
         table_json = json.dumps(table_list, indent=2, ensure_ascii=False)
         
-        return original_json, table_json
+        return table_json
     else:
         print('未能找到表格信息')
         return ''
 
-def file_loader(file_path, output_dir: str) -> dict:
+def file_loader(file_path, output_dir: str=None) -> dict:
     """
     读取文件的读取器
     目前支持的文件类型有：.pdf, .txt, .md
@@ -337,7 +337,11 @@ def file_loader(file_path, output_dir: str) -> dict:
 
         # 基于后缀，创建loader实例
         if file_extension in file_loader_mapping.keys():
-            file_info = document_loader(file_path, output_dir=output_dir)
+            if output_dir:
+                file_info = document_loader(file_path, output_dir=output_dir)
+            else:
+                file_info = document_loader(file_path).load()
+                # print(f"返回的变量类型：{type(file_info)}")
 
         # 加载并返回文档内容
         return file_info

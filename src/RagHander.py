@@ -5,22 +5,23 @@ import os
 import re
 from typing import List, Union, Optional
 from langchain_core.documents import Document
-from src.ContentHandler import get_system_message, json_extractor, apply_rrf, find_html_tables_in_markdown, find_files_in_directory, get_context_around_image, file_loader
-from src.ContentHandler import html_to_json
+from ContentHandler import get_system_message, json_extractor, apply_rrf, find_html_tables_in_markdown, find_files_in_directory, get_context_around_image, file_loader
+from ContentHandler import html_to_json, file_loader
 import weaviate
 import asyncio
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import Filter, MetadataQuery, BM25Operator
 from weaviate.util import generate_uuid5
 import pandas as pd
 import hashlib
 import ollama
 from funasr import AutoModel
-from funasr.utils.postprocess_utils import rich_transcription_postprocess
-import tqdm
 import markdown
 from bs4 import BeautifulSoup
 import shutil
-from src.FileLoaders import image_text_reader
+from FileLoaders import image_text_reader
+from funasr.utils.postprocess_utils import rich_transcription_postprocess
+from pathlib import Path
+import warnings
 
 
 class RAGTool:
@@ -50,14 +51,18 @@ class RAGTool:
         
 
         # 文档相关
-        self.document_types = config.get_setting("file")["types"]["text_file_extension"]  # 文档后缀
-        self.table_types = config.get_setting("file")["types"]["table_file_extension"]  # 表格后缀
-        self.audio_types = config.get_setting("file")["types"]["audio_file_extension"]  # 音频后缀
-        self.image_types = config.get_setting("file")["types"]["image_file_extension"]  # 图像后缀
-        self.default_file_access_level = config.get_setting("file")["default_file_access_level"]
+        self.long_text_threshold = config.get_setting("file")["long_text_threshold"]  # 长文本的最低字符限制
+        self.document_types = config.get_setting("files")["types"]["text_file_extension"]  # 文档后缀
+        self.table_types = config.get_setting("files")["types"]["table_file_extension"]  # 表格后缀
+        self.audio_types = config.get_setting("files")["types"]["audio_file_extension"]  # 音频后缀
+        self.image_types = config.get_setting("files")["types"]["image_file_extension"]  # 图像后缀
+        self.default_file_access_level = config.get_setting("files")["default_file_access_level"]  # 文档的默认访问级别
 
         # 输出相关
-        self.output_dir = config.get_setting("output_dir")
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)
+        project_root = os.path.dirname(script_dir)
+        self.output_dir = os.path.join(project_root, config.get_setting("files")["output_dir"])
 
         # 其他参数：
         self.model_retry_num = 3  # 遇到模型报错时的重试次数
@@ -101,23 +106,17 @@ class RAGTool:
                     if mode == "knowledge_base":
                         with document_collection.batch.dynamic() as batch:
                             for uuid, item in data_dict.items():
-                                if "content_vector" in item:
-                                    batch.add_object(
-                                        uuid=uuid,
-                                        properties=item.get("properties"),
-                                        vector={"content_vector": item.get("content_vector")},
-                                    )
-                                else:
-                                    batch.add_object(
-                                        uuid=uuid,
-                                        properties=item.get("properties")
-                                    )
+                                batch.add_object(
+                                    uuid=uuid,
+                                    properties=item.get("properties")
+                                )
 
                     # 检查批量操作中是否有错误
                     failed_objects = document_collection.batch.failed_objects
                     if failed_objects:
                         print(f"插入数据时发生错误数量: {len(document_collection.batch.failed_objects)}")
-
+                    else:
+                        print(f'插入数据成功')
                     return successful_mapping
                             
 
@@ -146,7 +145,7 @@ class RAGTool:
 
             # 匹配预设的文件类型，并返回
             if file_extension in self.document_types:
-                return "text"
+                return "document"
             elif file_extension in self.audio_types:
                 return "audio"
             elif file_extension in self.table_types:
@@ -156,16 +155,17 @@ class RAGTool:
             else:
                 raise ValueError(f'不支持的文件格式:{file_extension}')
 
-    def text_clear_formatting(self, docs:List[Document], metadata_dicts: List[dict]) -> List[Document]:
+    def text_clear_formatting(self, docs:List[Document]) -> List[Document]:
         """
         清除文档中的格式化信息,并生成Document对象
         """
         new_docs = []  # 储存清洗后的文档
-        for doc, meta in zip(docs, metadata_dicts):
+        for doc in docs:
+            meta = doc.metadata
             # 转为纯文本
             doc_text = doc.page_content
             html = markdown.markdown(doc_text)
-            soup = BeautifulSoup(html, "html.paerser")
+            soup = BeautifulSoup(html, "html.parser")
             text = soup.get_text()
 
             # 转为Document
@@ -176,7 +176,19 @@ class RAGTool:
 
         return new_docs
 
-    def clean_text(self, docs: List[Document]) -> List[Document]:
+    def clean_text(self, 
+                   docs: List[Document],
+                   do_clear_space: bool = True,
+                   do_clear_enter: bool = True,
+                   do_clear_hyphen: bool = True,
+                   do_clear_space_ch: bool = True,
+                   do_sentence_fix: bool = True,
+                   do_clear_page_tag: bool = True,
+                   do_clear_noise: bool = True,
+                   do_clear_unknown_letter: bool = True,
+                   do_clear_emoji: bool = False,
+                   do_clear_spend_in_head_tail: bool = True
+                   ) -> List[Document]:
         """
         文本清洗函数
         """
@@ -187,57 +199,87 @@ class RAGTool:
             content = doc.page_content 
 
             # (英文内容)替换多个空格为一个
-            content = re.sub(r'\s+', ' ', content)
+            if do_clear_space:
+                print('合并空格')
+                print(f"输入内容：{content}")
+                content = re.sub(r'\s+', ' ', content)
 
             # (英文内容)替换多个换行符为一个
-            content = re.sub(r'\n+', '\n', content)
+            if do_clear_enter:
+                print('合并换行符')
+                print(f"输入内容：{content}")
+                content = re.sub(r'\n+', '\n', content)
 
             # (英文内容)去除文档中的连字符
-            content = re.sub(r'-\s*\n', '', content)
+            if do_clear_hyphen:
+                print('去除连字符')
+                print(f"输入内容：{content}")
+                content = re.sub(r'-\s*\n', '', content)
 
             # (中文内容)移除中文文本之间的多余空格
-            ontent = re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', content)
+            if do_clear_space_ch:
+                print('删除中文文本之间的空格')
+                print(f"输入内容：{content}")
+                content = re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', content)
 
             # 合并被错误切分的段落或句子
-            content = re.sub(r'(?<![。！？\n])\n', '', content)
-            content = re.sub(r'\n+', '\n', content)
+            if do_sentence_fix:
+                print('修复被错误切分的段落或句子')
+                print(f"输入内容：{content}")
+                content = re.sub(r'(?<![。！？\n])\n', '', content)
+                content = re.sub(r'\n+', '\n', content)
 
             # 去除页眉页脚和页码等噪音信息
-            content = re.sub(r'(?i)第\s*\d+\s*页', '', content)
-            content = re.sub(r'(?i)page\s*\d+', '', content)
+            if do_clear_page_tag:
+                print('删除页眉页脚等信息')
+                print(f"输入内容：{content}")
+                content = re.sub(r'(?i)第\s*\d+\s*页', '', content)
+                content = re.sub(r'(?i)page\s*\d+', '', content)
 
             # 移除重复性的乱码噪声
-            noise_pattern = r"([\s`\\/’'\'V丶、()]+){5,}"
-            content = re.sub(noise_pattern, ' ', content)
-            content = re.sub(r'\s+', ' ', content).strip()
+            if do_clear_noise:
+                print("删除重复性乱码")
+                print(f"输入内容：{content}")
+                noise_pattern = r"([\s`\\/’'\'V丶、()]+){5,}"
+                content = re.sub(noise_pattern, ' ', content)
+                content = re.sub(r'\s+', ' ', content).strip()
 
             # 去除无法识别的乱码与字符
-            allowed_chars = re.compile(
-                r'[^\u4e00-\u9fa5'  # 中日韩统一表意文字
-                r'a-zA-Z0-9'       # 字母和数字
-                r'\s'              # 空白符 (包括空格, \n, \t)
-                r'，。！？：；（）《》【】｛｝“”’、' # 中文标点
-                r',.?!:;()\[\]{}<>"\'~`@#$%^&*-_=+|\\/' # 英文标点和符号
-                r']'
-            )
-            content = allowed_chars.sub('', content)
+            if do_clear_unknown_letter:
+                print("统一文字与符号")
+                print(f"输入内容：{content}")
+                allowed_chars = re.compile(
+                    r'[^\u4e00-\u9fa5'  # 中日韩统一表意文字
+                    r'a-zA-Z0-9'       # 字母和数字
+                    r'\s'              # 空白符 (包括空格, \n, \t)
+                    r'，。！？：；（）《》【】｛｝“”’、' # 中文标点
+                    r',.?!:;()\[\]{}<>"\'~`@#$%^&*-_=+|\\/' # 英文标点和符号
+                    r']'
+                )
+                content = allowed_chars.sub('', content)
 
             # 去除表情
-            emoji_pattern = re.compile(
-                "["
-                "\U0001F600-\U0001F64F"  # emoticons
-                "\U0001F300-\U0001F5FF"  # symbols & pictographs
-                "\U0001F680-\U0001F6FF"  # transport & map symbols
-                "\U0001F1E0-\U0001F1FF"  # flags (iOS)
-                "\U00002702-\U000027B0"
-                "\U000024C2-\U0001F251"
-                "]+",
-                flags=re.UNICODE,
-            )
-            content = emoji_pattern.sub(r'', content)
+            if do_clear_emoji:
+                print("删除表情符号")
+                print(f"输入内容：{content}")
+                emoji_pattern = re.compile(
+                    "["
+                    "\U0001F600-\U0001F64F"  # emoticons
+                    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+                    "\U0001F680-\U0001F6FF"  # transport & map symbols
+                    "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                    "\U00002702-\U000027B0"
+                    "\U000024C2-\U0001F251"
+                    "]+",
+                    flags=re.UNICODE,
+                )
+                content = emoji_pattern.sub(r'', content)
 
             # 去除开头和结尾处的空白字符
-            content = content.strip()
+            if do_clear_spend_in_head_tail:
+                print("删除开头和结尾的空白符")
+                print(f"输入内容：{content}")
+                content = content.strip()
 
             # 构建一个新的Document对象
             new_doc = Document(page_content=content, metadata=doc.metadata)
@@ -352,7 +394,7 @@ class RAGTool:
         对输入的文档内容进行内容拼接的函数(异步处理)
         """
         # print('拼接输入:', contents)
-        tasks = [self.text_pitch(content) for content in contents]
+        tasks = [self.text_fusion_async(content) for content in contents]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         print('拼接返回：')
         for i, result in enumerate(results):
@@ -406,8 +448,12 @@ class RAGTool:
                 return e
  
         # 提取输出json
+        raw_content = response['message']['content']
+        clean_output = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+        print(f"***clean content: {clean_output}")
         try:
-            output_json = json_extractor(response['message']['content'])
+            output_json = json_extractor(clean_output)
+            print(f"***提取出的json对象为:{output_json}")
 
             # 返回格式化后的文档内容
             formatted_chunkers = []
@@ -422,6 +468,7 @@ class RAGTool:
             else:
                 return last_exception
         except Exception as e:
+            print(f"文档分块失败：{e}")
             return e
 
     async def text_chunk_splitter_handler_async(self, contents: List[Document]) -> List[Document]:
@@ -429,35 +476,39 @@ class RAGTool:
         基于markdown格式的文本分块函数(批量)
         """
         # print(f'文档分块输入内容：', contents)
-        tasks = [self.text_chunk_splitter(content) for content in contents if isinstance(content, Document)]
+        tasks = [self.text_chunk_splitter_async(content) for content in contents if isinstance(content, Document)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        # print(f'文档分块输出内容：', len(results))
+        print(f'文档分块输出内容：', results)
 
         # 展评list
         output_results = []
         for result in results:
-            # print('result', result)
             for res in result:
-                # print("res", res)
                 if isinstance(res, Document):
                     output_results.append(res)
         return output_results
     
-    async def text_processor_async(self, content: Document) -> dict:
+    def add_uuid(self, contents: List[Document]) -> List[Document]:
         """
-        对文档块内容进行处理的函数（概括与问题派生）,以及生成哈希和uuid
         """
+        # 输入解析
+        new_contents = []
+        for content in contents:
+            input_content = content.page_content
+
+            # 生成分块的哈希和uuid
+            orignal_text = input_content.strip().lower()
+            orignal_hash = hashlib.sha256(orignal_text.encode('utf-8')).hexdigest()
+            generated_id = generate_uuid5(identifier=orignal_text, namespace=orignal_hash)
+            content.metadata['hash'] = orignal_hash
+            content.metadata['uuid'] = generated_id
+            new_contents.append(content)
+        return new_contents
+
+    async def text_summary_async(self, content: Document) -> Document:
         # 输入解析
         input_content = content.page_content
 
-        # 生成分块的哈希和uuid
-        orignal_text = input_content.strip().lower()
-        orignal_hash = hashlib.sha256(orignal_text.encode('utf-8')).hexdigest()
-        generated_id = generate_uuid5(identifier=orignal_text, namespace=orignal_hash)
-        content.metadata['hash'] = orignal_hash
-        content.metadata['uuid'] = generated_id
-
-        # 内容概括部分
         # 构建message
         if len(input_content) >= 50:
             system_message = get_system_message('text_summary')
@@ -499,7 +550,24 @@ class RAGTool:
         else:
             summary_json = {"summary": input_content}
 
-        # 问题派生部分
+        # 构建doc
+        new_doc = Document(page_content=summary_json["summary"], metadata=content.metadata)
+        return new_doc
+    
+    async def text_summary_handler_async(self, contents: List[Document]) -> List[Document]:
+        """
+        """
+        tasks = [self.text_summary_async(content) for content in contents if isinstance(content, Document)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 结果过滤
+        successful_results = [res for res in results if isinstance(res, Document)]
+        return successful_results
+    
+    async def text_question_derive_async(self, content: Document) -> Document:
+        # 输入解析
+        input_content = content.page_content
+
         # 构建message
         system_message = get_system_message('questions')
         message = [
@@ -537,135 +605,20 @@ class RAGTool:
         if "questions" not in question_json:
             question_json = {"questions": ""}
 
-        # 构建输出对象
-        output_obejct = {"content": Document(page_content=input_content, metadata=content.metadata),
-                         "summary": Document(page_content=summary_json["summary"], metadata=content.metadata),
-                         "questions": Document(page_content=question_json["questions"], metadata=content.metadata)}
+        # 构建新的doc
+        new_doc = Document(page_content=question_json["questions"], metadata=content.metadata)
+        return new_doc
 
-
-        return output_obejct
-
-    async def text_processor_handler_async(self, contents) -> List[dict]:
+    async def text_question_derive_handler_async(self, contents: List[Document]) -> List[Document]:
         """
-        对文档内容进行精简和概括的函数(批量)
         """
-        # for content in contents[:15]:
-        #     print(f'文档概括输入内容：', type(content), content.page_content)
-        tasks = [self.text_processor(content) for content in contents]
+        tasks = [self.text_question_derive_async(content) for content in contents if isinstance(content, Document)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        # for content in results[:5]:
-        #     print(content)
 
         # 结果过滤
-        successful_results = [res for res in results if isinstance(res, dict)]
-        return successful_results   
-    
-    def save_knowledge_data_generator(self, contents:List[Document], metadata_dict:dict, image_embeddings: list):
-        """
-        生成用于知识库向量数据库的dict对象
-        """
-        data_dict = {}
-        for content in contents:
-            # 文本内容
-            content_text = content["content"].page_content
-            summary_text = content["summary"].page_content
-            questions_text = content["questions"].page_content
+        successful_results = [res for res in results if isinstance(res, Document)]
+        return successful_results
 
-            # 元数据：来自文件
-            metadata = content["content"].metadata
-            uuid = metadata.get("uuid")
-            source = metadata.get("source")
-            document_type = metadata.get("info_type", "")
-            page_number = metadata.get("page_number", -1)
-            chunk_seq_id = metadata.get("chunk_seq_id", -1)
-
-            # 元数据：外部传入
-            if metadata_dict:
-                access_level = metadata_dict.get("access_level", 0)
-            else:
-                access_level = 0
-
-            # 组合字段
-            if uuid not in data_dict.keys():
-                data_dict[uuid] = {"properties": {
-                                       "content": content_text, 
-                                       "summary": summary_text,
-                                       "questions": questions_text,
-                                       "source": source,
-                                       "document_type": document_type,
-                                       "access_level": access_level,
-                                       "page_number": page_number,
-                                       "chunk_seq_id": chunk_seq_id
-                                   }
-                                }
-            # 添加图像向量
-            if image_embeddings:
-                data_dict[uuid]["content_vector"] = image_embeddings
-        return data_dict
-
-    async def text_correction_async(self, text_dict: dict) -> Document:
-        """
-        对音频识别的结果进行纠偏处理
-        """
-        # 提取音频识别结果
-        text_1 = text_dict.get('text_1', "")
-        text_2 = text_dict.get('text_2', "")
-
-        # message构建
-        system_message = get_system_message('text_correction')
-        message = [
-            {
-                "role": "system",
-                "content": system_message
-             },
-             {
-                "role": "user",
-                "content": f"请结合两个版本的音频识别结果，对比校正的出一个纠正文本错误后的新版本。ARS识别结果1：{text_1} \nARS识别结果2:{text_2}" 
-             }
-        ]
-
-        # 模型交互,针对503错误重试
-        last_exception = None
-        for attempt in range(self.model_retry_num):
-            try:
-                response = await self.async_client.chat(model=self.generative_model_name, 
-                                                        messages=message,
-                                                        options=self.ollama_model_option)
-            except ollama.ResponseError as e:
-                if e.status_code == 503:
-                    last_exception = e
-                    wait_time = 2 * attempt
-                    print(f'遇到503错误，等待{wait_time}秒后重试...')
-                    await asyncio.sleep(wait_time)
-                else:
-                    return e
-            except Exception as e:
-                return e
- 
-        # 提取输出json并处理
-        try:
-            output_json = json_extractor(response['message']['content'])
-            if "corrected_text" in output_json:
-                corrected_text = output_json["corrected_text"]
-                return Document(page_content=corrected_text, metadata={"page_number": 0})
-            else:
-                return last_exception
-        except ValueError as e:
-            return e
-
-    async def text_correction_handler_async(self, text_dict_list: List[dict]) -> List[Document]:
-        """
-        异步对音频识别文档结果进行纠错
-        """
-        # print(f'文档纠错输入内容：', contents)
-        tasks = [self.text_correction_async(text_dict) for text_dict in text_dict_list if isinstance(text_dict, dict)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        # print(f'文档纠错输出内容：', len(results))
-
-        # 结果筛选
-        output_results = [result for result in results if isinstance(result, Document)]
-        return output_results
-    
     async def table_content_description_async(self, table_content: dict):
         """
         对JSON化的表格内容进行描述
@@ -704,12 +657,41 @@ class RAGTool:
         # 提取输出json
         try:
             output_content = json_extractor(response['message']['content'])
-            return output_content
+            return output_content['content']
         except Exception as e:
             return e
 
+    async def table_summary_async(self, content: Document) -> Document:
+        """
+        用于提取表格内容的函数
+        """
+        table_json = content.page_content
+
+        # 表格内容提炼:当行数大于20时,视为非文本表格
+        if len(table_json) >= 20:
+            raise ValueError(f'暂不支持大表格处理')
+        else:
+            # 概括信息
+            table_description = await self.table_content_description_async(table_json)
+
+        # 构建doc
+        new_doc = Document(page_content=table_description, metadata=content.metadata)
+        return new_doc
+
+    async def table_summary_handler_async(self, contents: List[Document]) -> List[Document]:
+        """
+        批量提取表格内容概括的函数
+        """
+        tasks = [self.text_summary_async(content) for content in contents]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        print(f'表格概括结果为:{results}')
+        # 结果过滤
+        successful_results = [res for res in results if isinstance(res, Document)]
+        return successful_results
+    
     async def image_caption_async(self, image_path):
         # 构建图片描述信息
+        print('开始图片描述')
         system_message = get_system_message('image_caption')
         message = [
             {
@@ -719,7 +701,7 @@ class RAGTool:
             {
                 "role": "user",
                 "content": "请尽可能详尽地描述传入的图片",
-                "images": [{image_path}]
+                "images": [Path(image_path)]
             }
         ]
 
@@ -727,7 +709,7 @@ class RAGTool:
         last_exception = None
         for attempt in range(self.model_retry_num):
             try:
-                response = await self.async_client.chat(model=self.generative_model_name, 
+                response = await self.async_client.chat(model=self.image_caption_model_name, 
                                                         messages=message,
                                                         options=self.ollama_model_option)
             except ollama.ResponseError as e:
@@ -739,13 +721,17 @@ class RAGTool:
                 else:
                     return e
             except Exception as e:
+                print(f'图片描述模型失败 {e}')
                 return e
  
         # 提取输出json
+        print(f'开始提取json')
         try:
-            output_content = json_extractor(response['message']['image_caption'])
-            return output_content
+            output_content = json_extractor(response['message']['content'])
+            print(f'***图像描述：{output_content}')
+            return output_content["image_caption"]
         except Exception as e:
+            print("json提取失败")
             return e
 
     async def image_description_fusion_async(self, image_description:str, image_content: str, image_text: str):
@@ -785,28 +771,313 @@ class RAGTool:
  
         # 提取输出json
         try:
-            output_content = json_extractor(response['message']['description'])
-            return output_content
+            output_content = json_extractor(response['message']['content'])
+            return output_content['description']
         except Exception as e:
             return e
+
+    async def extract_keywords(self, request: str):
+        """
+        提取request中的关键词的函数
+        """
+        # 创建message
+        system_message = get_system_message('keywords')
+        message = [
+            {
+                "role": "system",
+                "content": system_message
+             },
+             {
+                "role": "user",
+                "content": f"请求信息的内容如下:{request}" 
+             }
+        ]
+
+        # 模型交互
+        response = await self.async_client.chat(model=self.generative_model_name, 
+                                                messages=message,
+                                                options=self.ollama_model_option)
         
+        # 提取输出json
+        raw_content = response['message']['content']
+        clean_output = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+        output_keywords = json_extractor(clean_output)
+        keyswords = ''
+        for keyword in output_keywords["keywords"]:
+            keyswords = keyswords + keyword + ' '
+
+        if len(keyswords) == 0:
+            warnings.warn(message=f"请求{request}提取关键词失败，关键词检索的结果可能不准确")
+        return keyswords
+
+    async def text_model_processor_async(self, content, mode: str):
+        """
+        基于模式生成大模型message用于各种任务
+        """
+        # 解析content
+        if isinstance(content, Document):
+            if mode == "text_fusion":
+                above_document = content.get('above_content', '')
+                if isinstance(above_document, Document):
+                    above_content = above_document.page_content
+                else:
+                    above_content = above_document
+
+                target_document = content.get('target_content')
+                target_content = target_document.page_content
+
+                below_document = content.get('below_content', '')
+                if isinstance(below_document, Document):
+                    below_content = below_document.page_content
+                else:
+                    below_content = below_document
+            else:
+                message_info = Document.page_content
+        elif isinstance(content, str):
+            message_info = content
+        else:
+            raise ValueError(f'传入大模型处理的参数不正确，当前参数为 content = {content}, mode = {mode}')
+        
+        # 基于mode抽取system message,并构建与大模型交互的message
+        message = None
+        system_message = get_system_message(mode)
+        if mode == "text_fusion":  # 基于页面上下文对当前页面内容进行补完
+            message = [
+                {
+                    "role": "system",
+                    "content": system_message
+                },
+                {
+                    "role": "user",
+                    "content": f"请基于以下信息，对目标页内容进行拼接：上文页内容: {above_content}, 目标页内容：{target_content}, 下文页内容：{below_content}" 
+                }
+            ]
+        elif mode == "chunks":  # 对传入的文本进行语义分块
+            message = [
+                {
+                    "role": "system",
+                    "content": system_message
+                },
+                {
+                    "role": "user",
+                    "content": f"请对以下文本进行分块：{message_info}" 
+                }
+            ]
+        elif mode == "text_summary":  # 对传入的语义块进行内容概括
+            if len(message_info) >= self.long_text_threshold:
+                message = [
+                    {
+                        "role": "system",
+                        "content": system_message
+                    },
+                    {
+                        "role": "user",
+                        "content": f"请对以下文本进行概括总结：{message_info}" 
+                    }
+                ]
+            else:
+                summary_json = {"summary": message_info}
+                message = None
+        elif mode == "questions":  # 基于传入的内容，生成可能的提问
+            message = [
+                {
+                    "role": "system",
+                    "content": system_message
+                },
+                {
+                    "role": "user",
+                    "content": f"请针对以下内容设计提问：{message_info}" 
+                }
+            ]
+        elif mode == "table_description":  # 对传入的表格进行内容概括
+            if len(message_info) > 20:
+                print('暂时不支持大型表格处理')
+                pass
+            else:
+                message = [
+                    {
+                        "role": "system",
+                        "content": system_message
+                    },
+                    {
+                        "role": "user",
+                        "content": f"请对以下文本进行概括总结：{message_info}" 
+                    }
+                ]
+        elif mode == "image_caption":  # 对传入的图像进行描述
+            message = [
+                {
+                    "role": "system",
+                    "content": system_message
+                },
+                {
+                    "role": "user",
+                    "content": "请尽可能详尽地描述传入的图片",
+                    "images": [Path(message_info)]
+                }
+            ]
+        elif mode == "keywords":  #  对传入的请求信息进行关键词提取
+            message = [
+                {
+                    "role": "system",
+                    "content": system_message
+                },
+                {
+                    "role": "user",
+                    "content": f"请提取以下请求信息中的关键词:{message_info}" 
+                }
+            ]
+        else:
+            raise ValueError(f'传入的mode参数不正确，当年参数值为{mode}')
+        
+        # 大模型交互
+        last_exception = None
+        for attempt in range(self.model_retry_num):
+            try:
+                response = await self.async_client.chat(model=self.generative_model_name, 
+                                                        messages=message,
+                                                        options=self.ollama_model_option)
+            except ollama.ResponseError as e:
+                if e.status_code == 503:
+                    last_exception = e
+                    wait_time = 2 * attempt
+                    print(f'遇到503错误，等待{wait_time}秒后重试...')
+                    await asyncio.sleep(wait_time)
+                else:
+                    return e
+            except Exception as e:
+                return e
+            
+        # 删除模型的思考内容
+        raw_response = response['message']['content']
+        clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+
+        # 提取返回的json信息
+        output_json = json_extractor(clean_response)
+
+        # 基于mode对模型进行针对性处理
+        if mode == "text_fusion":
+            if "target_content" in output_json:
+                new_doc = Document(page_content=output_json["target_content"], metadata=content.metadata)
+                return new_doc
+            else:
+                raise ValueError(f'没有在模型的返回中找到目标字段，当前返回内容为{output_json}')
+        if mode == "chunks":
+            formatted_chunkers = []
+            if "chunks" in output_json:
+                output_list = output_json["chunks"]
+                for index, output_content in enumerate(output_list):
+                    chunk_metadata = content.metadata
+                    chunk_metadata['chunk_seq_id'] = index
+                    chunk_document = Document(page_content=output_content, metadata=chunk_metadata)
+                    formatted_chunkers.append(chunk_document)
+                return formatted_chunkers
+            else:
+                return ValueError(f'没有在模型的返回中找到目标字段，当前返回内容为{output_json}')
+        if mode == "text_summary":
+            if "summary" not in output_json:
+                warnings.warm(f'没有在模型的返回中找到目标字段，当前返回内容为，返回默认值信息')
+                output_json = {"summary": message_info}
+            new_doc = Document(page_content=output_json["summary"], metadata=content.metadata)
+            return new_doc
+        if mode == "questions":
+            if "questions" not in output_json:
+                warnings.warm(f'没有在模型的返回中找到目标字段，当前返回内容为，返回默认值信息')
+                output_json = {"questions": ""}
+            new_doc = Document(page_content=output_json["questions"], metadata=content.metadata)
+        if mode == "table_description":
+            if "content" in output_json:
+                return output_json["content"]
+            else:
+                warnings.warm(f'没有在模型的返回中找到目标字段，当前返回内容为，返回默认值信息')
+        if mode == "image_caption":
+            if "image_caption" in output_json:
+                return output_json["image_caption"]
+            else:
+                warnings.warm(f'没有在模型的返回中找到目标字段，当前返回内容为，返回默认值信息')
+        if mode == "keywords":
+            keyswords = ''
+            if "keywords" in output_json:
+                for keyword in output_json["keywords"]:
+                    keyswords = keyswords + keyword + ' '
+
+                if len(keyswords) == 0:
+                    warnings.warn(message=f"请求{request}提取关键词失败，关键词检索的结果可能不准确")
+                return keyswords
+            else:
+                warnings.warm(f'没有在模型的返回中找到目标字段，当前返回内容为，返回默认值信息')
+        return last_exception
+
+    async def text_model_processor_handler_async(self, contents: List[Document], mode: str) -> List[Document]:
+        """
+        批量调用大模型并进行处理的函数
+        """
+        modes = [mode] * len(contents)
+        tasks = [self.text_model_processor_async(content, mode) for content, mode in zip(contents, modes)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        print(f'表格概括结果为:{results}')
+        # 结果过滤
+        successful_results = [res for res in results if (isinstance(res, Document) or isinstance(res, dict) or isinstance(res, str))]
+        return successful_results
+
+
+    def save_knowledge_data_generator(self, contents:List[Document]):
+        """
+        生成用于知识库向量数据库的dict对象
+        """
+        data_dict = {}
+        for content in contents:
+            # 文本内容
+            content_text = content["content"].page_content
+            summary_text = content["summary"].page_content
+            questions_text = content["questions"].page_content
+
+            # 元数据：来自文件
+            metadata = content["content"].metadata
+            uuid = metadata.get("uuid")
+            source = metadata.get("source")
+            file_type = metadata.get("file_type", "")
+            # page_number = metadata.get("page_number", -1)
+            chunk_seq_id = metadata.get("chunk_seq_id", -1)
+            access_level = metadata.get("access_level", 0)
+            chunk_type = metadata.get("element_type", "")
+
+            # 组合字段
+            if uuid not in data_dict.keys():
+                data_dict[uuid] = {"properties": {
+                                       "content": content_text, 
+                                       "summary": summary_text,
+                                       "questions": questions_text,
+                                       "source": source,
+                                       "file_type": file_type,
+                                       "chunk_type": chunk_type,
+                                       "access_level": access_level,
+                                    #    "page_number": page_number,
+                                       "chunk_seq_id": chunk_seq_id
+                                   }
+                                }
+        return data_dict
+
 
     ###################################################### 整合函数  ######################################################
     async def text_pipeline_async(self, 
                                   file_info: Optional[dict] = None,
                                   text_doc: Optional[Document] = None, 
                                   do_text_clean: bool=True, 
-                                  do_text_correction: bool=False,
                                   do_text_fusion: bool=False,
                                   do_text_chunk: bool=True,
-                                  do_text_processor: bool=True) -> List[dict]:
+                                  do_text_summary: bool=True,
+                                  do_table_summary: bool=False,
+                                  do_question_derive: bool=True
+                                  ) -> List[dict]:
         """
         文本处理流水线函数
         """
         if file_info:
             # 读取文件，生成document对象 
             text_path = file_info['element_path']
-            text_doc = self.file_reader(text_path)
+            text_doc = file_loader(text_path)[0]
+            print(f"文本信息：{text_doc}")
 
             # 更新元数据信息
             text_doc.metadata["source"] = file_info.get("source", "")
@@ -814,30 +1085,67 @@ class RAGTool:
             text_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
 
         # 文本去格式化(markdown转text)
+        print(f'开始对文本去格式化')
         processed_contents = self.text_clear_formatting([text_doc])
 
         # 文本清洗
         if do_text_clean:
+            print(f'执行文本清洗')
+            print(f'输入的变量信息：{processed_contents}')
             processed_contents = self.clean_text(processed_contents)
-
-        # 文本纠正
-        if do_text_correction:
-            processed_contents = await self.text_correction_handler_async(processed_contents)
 
         # 文本拼接
         if do_text_fusion:
+            print(f'执行文本内容拼接')
+            print(f'输入的变量信息：{processed_contents}')
             processed_contents = await self.text_fusion_handler_async(processed_contents)
 
         # 文本分块
         if do_text_chunk:
+            print(f'执行文本分块')
+            print(f'输入的变量信息：{processed_contents}')
             processed_contents = await self.text_chunk_splitter_handler_async(processed_contents)
 
-        # 文本处理
-        if do_text_processor:
-            processed_contents = await self.text_processor_handler_async(processed_contents)
+        # 为分块处理后的doc添加uuid
+        print("添加uuid")
+        print(f'输入的变量信息：{processed_contents}')
+        processed_contents = self.add_uuid(processed_contents)
+        summary_contents = [Document(page_content='', metadata={})] * len(processed_contents)
+        question_contents = [Document(page_content='', metadata={})] * len(processed_contents)
+
+        # 文本概括
+        if do_text_summary:
+            print(f'执行文本概括')
+            print(f'输入的变量信息：{processed_contents}')
+            summary_contents = await self.text_summary_handler_async(processed_contents)
+
+        # 表格概括
+        if do_table_summary:
+            print(f'执行表格内容概括')
+            print(f'输入的变量信息：{processed_contents}')
+            summary_contents = await self.table_summary_handler_async(processed_contents)
+            print(f'输出的变量信息：{summary_contents}')
+
+        # 问题派生
+        if do_question_derive:
+            print(f'执行派生提问')
+            print(f'输入的变量信息：{processed_contents}')
+            question_contents = await self.text_question_derive_handler_async(processed_contents)
+            print(f'输出的变量信息：{question_contents}')
+
+        # 拼接输出字典
+        output_list = []
+        for content_doc, summary_doc, questions_doc in zip(processed_contents, summary_contents, question_contents):
+            output_list.append(
+                {
+                    "content": content_doc,
+                    "summary": summary_doc,
+                    "questions": questions_doc
+                }
+            )
 
         #返回结果
-        return processed_contents
+        return output_list
 
     async def table_pipeline_async(self, file_info: dict) -> List[dict]:
         """
@@ -845,28 +1153,22 @@ class RAGTool:
         """
         table_path = file_info.get("element_path", None)
         if table_path:
-            table_text = self.file_reader(table_path)
+            table_text = file_loader(table_path)
         else:
             table_text = file_info["element_content"]
 
         # 表格内容转json
         table_json = html_to_json(table_text)
-
-        # 表格内容提炼:当行数大于20时,视为非文本表格
-        if len(table_json) >= 20:
-            raise ValueError(f'暂不支持大表格处理')
-        else:
-            # 大模型提取信息
-            table_description = await self.table_content_description_async(table_json)
         
         # 更新元数据信息
-        table_doc = Document(page_content=table_description, metadata={})
+        print(f'表格json信息：{table_json}')
+        table_doc = Document(page_content=str(table_json), metadata={})
         table_doc.metadata["source"] = file_info.get("source", "")
         table_doc.metadata["file_type"] = file_info.get("file_type", "")
         table_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
 
         # 表格元素处理
-        processed_contents = await self.text_pipeline_async(text_doc=table_doc, do_text_chunk=False)
+        processed_contents = await self.text_pipeline_async(text_doc=table_doc, do_text_chunk=False, do_text_summary=False, do_table_summary=True)
         return processed_contents
 
     async def audio_pipeline_async(self, file_info: dict) -> List[dict]:
@@ -874,7 +1176,21 @@ class RAGTool:
         音频文件的处理管道
         """
         audio_path = file_info['element_path']
-        audio_doc = await self.audio_to_text_handler_async(audio_paths=audio_path)
+        audio_response = self.audio_model.generate(
+            input= audio_path,
+            cache={},
+            language="auto",  
+            use_itn=True,
+            batch_size_s=60,
+            merge_vad=True,  
+            merge_length_s=15,
+        )
+        audio_text = rich_transcription_postprocess(audio_response[0]["text"])
+        print(f'音频文本:{audio_text}')
+
+        # 生成doc
+        audio_doc = Document(page_content=audio_text, metadata={})
+
 
         # 更新元数据信息
         audio_doc.metadata["source"] = file_info.get("source", "")
@@ -892,33 +1208,33 @@ class RAGTool:
         # 信息提取
         image_path = file_info.get("element_path", None)
         image_content = file_info.get("element_content", "")
+        print(f'图像上下文内容: {image_content}')
 
         # 生成图片描述
         image_description = await self.image_caption_async(image_path=image_path)
+        print(f'图像描述内容: {image_description}')
 
         # 识别图片的文字内容
         image_text = image_text_reader(image_path)
-            
-        # 拼接图像文本
-        if len(image_content) == 0:  # 无法找到图像的上下文
-            pass
-        else:
-            all_image_text = f"图片的描述内容为：{image_description}, 图片内文字内容为：{image_text}, 图片所在上下文内容为：{image_content}"
+        print(f'图像文字内容: {image_text}')
 
         # 综合生成图片描述
         image_description_fusion = await self.image_description_fusion_async(image_description=image_description,
                                                                              image_content=image_content,
                                                                              image_text=image_text)
+        print(f"图像的综合描述结果：{image_description_fusion}")
 
         # 生成文本doc
         image_doc = Document(page_content=image_description_fusion, metadata={})
 
         # 更新元数据信息
+        print("开始更新和同步图片的元数据信息")
         image_doc.metadata["source"] = file_info.get("source", "")
         image_doc.metadata["file_type"] = file_info.get("file_type", "")
         image_doc.metadata["access_level"] = file_info.get("access_level", self.default_file_access_level)
 
         # 图像描述文本处理
+        print("开始对图像文本进行处理")
         processed_contents = await self.text_pipeline_async(text_doc=image_doc, do_text_chunk=False)
         return processed_contents
 
@@ -1000,7 +1316,6 @@ class RAGTool:
         负责单个文件的ETF流程。这个函数内部包含了所有的异步和批量操作
         """
         async with semaphore:
-            image_embeddings = None  # 图像embeddings初始化
             temp_dir_path = None  # 初始化临时保存地址
             try:
                 # 1. 识别文件类型
@@ -1013,7 +1328,7 @@ class RAGTool:
                 if file_type == 'document':
                     # 文件解析
                     element_list = []
-                    parse_result = file_loader([file_path], self.output_dir)
+                    parse_result = file_loader(file_path, self.output_dir)
                     formatted_text_path = parse_result.get("text_path")
                     image_dir = parse_result.get("image_path")
                     temp_dir_path = parse_result.get("temp_dir_path")
@@ -1035,34 +1350,38 @@ class RAGTool:
                             "element_path": full_image_path,
                             "element_type": "image",
                             "element_content": image_content,
-                            "source": file_path, "file_type": file_type} | metadata_dict)
+                            "source": file_path, "file_type": file_type, "chunk_type": 'image'} | metadata_dict)
                 else:
                     # 读取文件
                     element_list = [{"element_path": file_path, "element_type": file_type, "source": file_path, "file_type": file_type} | metadata_dict]
-
                 # 3 基于元素类型进行分流处理
                 for element_info in element_list:
                     element_type = element_info["element_type"]
                     print(f'当前文档元素的类型为:{element_type}')
                     if element_type == "text":  # 3.1 文本处理
+                        print('开始处理文本内容')
                         processed_contents = await self.text_pipeline_async(file_info=element_info)
                     elif element_type == "table":  # 3.2 表格文件处理
-                        processed_contents = await self.table_pipeline_async(table_content=[element_info])
+                        print('开始处理表格内容')
+                        processed_contents = await self.table_pipeline_async(file_info=element_info)
                     elif element_type == "audio": # 3.3 音频文件处理
+                        print('开始处理音频内容')
                         processed_contents = await self.audio_pipeline_async(file_info=element_info)
                     elif element_type == "image":  # 3.4 图像文件处理
-                        processed_contents, image_embeddings = await self.image_pipeline_async(file_info=element_info)
+                        print('开始处理图像内容')
+                        processed_contents = await self.image_pipeline_async(file_info=element_info)
                     else:
                         raise ValueError(f'不支持的文件类型：{file_type}')
 
                     # 入库信息生成
                     print('入库信息生成')
-                    records_to_save = self.save_knowledge_data_generator(processed_contents, image_embeddings)
+                    # print(f'输入内容：{processed_contents}')
+                    records_to_save = self.save_knowledge_data_generator(processed_contents)
                     print(records_to_save)
 
                     # 6. 信息入库
                     print('信息入库')
-                    # successful_insert_info = await asyncio.to_thread(self.save_to_vector_database, records_to_save)
+                    successful_insert_info = await asyncio.to_thread(self.save_to_vector_database, records_to_save)
 
                 # 删除临时文件和文件夹
                 if temp_dir_path:
@@ -1080,7 +1399,7 @@ class RAGTool:
         """
         # 元数据处理
         if metadata is None:
-            metadata = [None] * len(file_paths)
+            metadata = [{"access_level": 0}] * len(file_paths)
 
         # 限制并发数量
         semaphore = asyncio.Semaphore(self.concurrency_limit)
@@ -1130,32 +1449,51 @@ class RAGTool:
                                                 options=self.ollama_model_option)
 
         # 提取输出json
-        answer_summary = json_extractor(response['message']['content'])
+        raw_content = response['message']['content']
+        clean_output = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+        answer_summary = json_extractor(clean_output)
         print('答案概括', answer_summary)
-
-        # 获取搜索参数
-        filter_info = None
         
         # 针对问题的检索
+        print("针对问题的检索")
         question_query_response = collection.query.near_text(
             query=request,
             limit=limit_search_num,
+            target_vector="question_vector",
             return_metadata=MetadataQuery(distance=True)           
         )
 
         # 针对概述的检索
+        print("针对概述的检索")
         summary_query_response = collection.query.near_text(
             query=answer_summary["answer_summary"],
+            # query=request,
             limit=limit_search_num,
+            target_vector="summary_vector",
             return_metadata=MetadataQuery(distance=True)
         )
 
         # 关键字/词检索
+        response = collection.query.bm25(
+            query=keyswords,
+            query_properties=["content"],
+            operator=BM25Operator.or_(minimum_match=1),
+            limit=5
+        )
+
+        print(f"问题为:{request}")
+        print(f"问题的关键字为:{keyswords}")
+        print(f"关键字回答为:")
+        for o in response.objects:
+            print(o.properties)
+            print('***')
+        print("***")
 
 
         # rrf算法输出结果
+        print("rrf算法rerank")
         rrf_response = apply_rrf([question_query_response, summary_query_response])
-        print(rrf_response)
+        # print("rerank结果", rrf_response)
 
         # 提取top匹配结果
         uuid_lst = rrf_response
@@ -1166,7 +1504,7 @@ class RAGTool:
         return response
 
 if __name__ == '__main__':
-    file_paths = ['data/Audios/vad_example.wav']
+    file_paths = ['data/Documents/室内空气质量检测报告.pdf']
     test_tool = RAGTool()
 
     # 检查和加载模型
@@ -1180,14 +1518,22 @@ if __name__ == '__main__':
     #     asyncio.run(test_tool.file_to_knowledge_database_handler_async(file_paths=file_paths))
     # except Exception as e:
     #     print(f"测试过程中发生错误: {e}")
-    asyncio.run(test_tool.file_to_knowledge_database_handler_async(file_paths=file_paths))
-    # # 向量数据库检索
-    # test_tool.connect_to_weative_database()
-    # test_collection = test_tool.vector_database_client.collections.get("knowledge_base_collection")
-    # request_info = "为什么温度设置为0时，大模型依然无法保证输出的稳定性？"
-    # seach_results = test_tool.search_knowledge_database(request=request_info)
-    # test_tool.close_weavier_connection()
-    # print('return search result:', seach_results)
+    # asyncio.run(test_tool.file_to_knowledge_database_handler_async(file_paths=file_paths))
+
+
+    # 向量数据库检索
+    test_collection = test_tool.vector_database_client.collections.get("knowledge_base_collection")
+    request_info = [
+        "负责这次检测的单位是？",
+        "主要使用的设备有什么？",
+        "请简述本次的主要依据",
+        "目标污染物有哪些?",
+        "测点位置在哪里?？"
+    ]
+    for ind, request in enumerate(request_info):
+        seach_results = asyncio.run(test_tool.search_knowledge_database(request=request))
+        # print(f'seach results for qeustion {ind+1}:', seach_results)
+        # print("************")
 
     # # 获取uuid
     # uuids = []

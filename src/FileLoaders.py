@@ -13,6 +13,10 @@ from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_j
 
 from paddleocr import PaddleOCR
 
+
+# 环境变量设置
+os.environ['MINERU_MODEL_SOURCE'] = "local"
+
 def pdf_parse(
     output_dir,  # Output directory for storing parsing results
     pdf_file_names: list[str],  # List of PDF file names to be parsed
@@ -100,8 +104,19 @@ def pdf_loader(
 def image_text_reader(image_path):
     ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
     result = ocr.predict(image_path)
+    output_text = '\n '
     for line in result:
-        print(line["rec_texts"])
+        if isinstance(line["rec_texts"], list):
+            for ind, item in enumerate(line["rec_texts"]):
+                if ind != len(line["rec_texts"]) - 1:
+                    output_text = output_text + item + ' '
+                else:
+                    output_text = output_text + item + '\n'
+        elif isinstance(line["rec_texts"], str):
+            output_text = output_text + line["rec_texts"] + '\n'
+        else:
+            pass
+    return output_text
 
 
 # if __name__ == '__main__':
