@@ -58,6 +58,12 @@ class RAGTool:
         self.image_types = config.get_setting("files")["types"]["image_file_extension"]  # 图像后缀
         self.default_file_access_level = config.get_setting("files")["default_file_access_level"]  # 文档的默认访问级别
 
+
+        # 检索相关
+        self.search_max_num = config.get_setting("search")["max_mun"]
+        self.search_output_num = config.get_setting("search")["output_mun"]
+
+        
         # 输出相关
         script_path = os.path.abspath(__file__)
         script_dir = os.path.dirname(script_path)
@@ -324,6 +330,23 @@ class RAGTool:
                 )
         return window_docs
     
+    def add_uuid(self, contents: List[Document]) -> List[Document]:
+        """
+        """
+        # 输入解析
+        new_contents = []
+        for content in contents:
+            input_content = content.page_content
+
+            # 生成分块的哈希和uuid
+            orignal_text = input_content.strip().lower()
+            orignal_hash = hashlib.sha256(orignal_text.encode('utf-8')).hexdigest()
+            generated_id = generate_uuid5(identifier=orignal_text, namespace=orignal_hash)
+            content.metadata['hash'] = orignal_hash
+            content.metadata['uuid'] = generated_id
+            new_contents.append(content)
+        return new_contents
+
     async def text_fusion_async(self, content: dict) -> Document:
         """"
         基于上下文对当前页面的内容进行补完
@@ -488,23 +511,6 @@ class RAGTool:
                     output_results.append(res)
         return output_results
     
-    def add_uuid(self, contents: List[Document]) -> List[Document]:
-        """
-        """
-        # 输入解析
-        new_contents = []
-        for content in contents:
-            input_content = content.page_content
-
-            # 生成分块的哈希和uuid
-            orignal_text = input_content.strip().lower()
-            orignal_hash = hashlib.sha256(orignal_text.encode('utf-8')).hexdigest()
-            generated_id = generate_uuid5(identifier=orignal_text, namespace=orignal_hash)
-            content.metadata['hash'] = orignal_hash
-            content.metadata['uuid'] = generated_id
-            new_contents.append(content)
-        return new_contents
-
     async def text_summary_async(self, content: Document) -> Document:
         # 输入解析
         input_content = content.page_content
@@ -776,7 +782,7 @@ class RAGTool:
         except Exception as e:
             return e
 
-    async def extract_keywords(self, request: str):
+    async def search_extract_keywords_async(self, request: str):
         """
         提取request中的关键词的函数
         """
@@ -809,6 +815,38 @@ class RAGTool:
         if len(keyswords) == 0:
             warnings.warn(message=f"请求{request}提取关键词失败，关键词检索的结果可能不准确")
         return keyswords
+
+    async def search_answer_summary_async(self, request, str):
+        """
+        基于传入的request信息，生成请求对于回答的概括
+        """
+        # 搜索请求提炼
+        system_message = get_system_message('answer_summary')
+        message = [
+            {
+                "role": "system",
+                "content": system_message
+             },
+             {
+                "role": "user",
+                "content": f"请求信息的内容如下:{request}" 
+             }
+        ]
+
+        # 模型交互
+        response = await self.async_client.chat(model=self.generative_model_name, 
+                                                messages=message,
+                                                options=self.ollama_model_option)
+
+        # 提取输出json
+        raw_content = response['message']['content']
+        clean_output = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
+        answer_summary = json_extractor(clean_output)
+        if "answer_summary" in answer_summary:
+            return answer_summary["answer_summary"]
+        else:
+            return ""
+
 
     async def text_model_processor_async(self, content, mode: str):
         """
@@ -1019,7 +1057,6 @@ class RAGTool:
         # 结果过滤
         successful_results = [res for res in results if (isinstance(res, Document) or isinstance(res, dict) or isinstance(res, str))]
         return successful_results
-
 
     def save_knowledge_data_generator(self, contents:List[Document]):
         """
@@ -1423,71 +1460,60 @@ class RAGTool:
     #     """
     #     pass
 
-    async def search_knowledge_database(self, request: str, limit_search_num: int=50,  limit_output_nun: int = 5, return_metadata: List[str]=None):
+    async def search_knowledge_database(self, request: str, ):
         """
         请求向量数据库,从知识库中搜索相关信息
         """
         # 连接数据表
         collection = self.vector_database_client.collections.get("knowledge_base_collection")
 
-        # 搜索请求提炼
-        system_message = get_system_message('answer_summary')
-        message = [
-            {
-                "role": "system",
-                "content": system_message
-             },
-             {
-                "role": "user",
-                "content": f"请求信息的内容如下:{request}" 
-             }
-        ]
-
-        # 模型交互
-        response = await self.async_client.chat(model=self.generative_model_name, 
-                                                messages=message,
-                                                options=self.ollama_model_option)
-
-        # 提取输出json
-        raw_content = response['message']['content']
-        clean_output = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
-        answer_summary = json_extractor(clean_output)
+        # 生成请求对应的答案的概括内容
+        answer_summary = asyncio.run(self.search_extract_keywords_async(request=request))
         print('答案概括', answer_summary)
         
-        # 针对问题的检索
+        # 针对请求的检索
         print("针对问题的检索")
         question_query_response = collection.query.near_text(
             query=request,
-            limit=limit_search_num,
+            limit=self.search_max_num,
             target_vector="question_vector",
             return_metadata=MetadataQuery(distance=True)           
         )
 
+        print(f"请求为:{request}")
+        print(f"基于请求的检索为:")
+        for o in question_query_response.objects:
+            print(o.properties)
+            print('***')
+        print("***")
+
         # 针对概述的检索
         print("针对概述的检索")
         summary_query_response = collection.query.near_text(
-            query=answer_summary["answer_summary"],
+            query=answer_summary,
             # query=request,
-            limit=limit_search_num,
+            limit=self.serach_max_num,
             target_vector="summary_vector",
             return_metadata=MetadataQuery(distance=True)
         )
 
         # 关键字/词检索
+        keyswords = asyncio.run(self.extract_keywords(request=request))
         response = collection.query.bm25(
             query=keyswords,
             query_properties=["content"],
+            limit=self.serach_max_num,
             operator=BM25Operator.or_(minimum_match=1),
             limit=5
         )
 
-        print(f"问题为:{request}")
-        print(f"问题的关键字为:{keyswords}")
-        print(f"关键字回答为:")
-        for o in response.objects:
-            print(o.properties)
-            print('***')
-        print("***")
+        # print(f"问题为:{request}")
+        # print(f"问题的关键字为:{keyswords}")
+        # print(f"关键字回答为:")
+        # for o in response.objects:
+        #     print(o.properties)
+        #     print('***')
+        # print("***")
 
 
         # rrf算法输出结果
