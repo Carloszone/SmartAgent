@@ -3,7 +3,7 @@ from jinja2 import Environment, FileSystemLoader
 import json
 import re
 import textwrap
-from typing import List, Optional
+from typing import List, Optional, Union
 import numpy as np
 from langchain_community.document_loaders import TextLoader
 from FileLoaders import pdf_loader, docx_Loader
@@ -69,6 +69,52 @@ def get_system_message(mode: str):
 
     return message
 
+
+def fusion_list_str(content: Union[str, list]) -> str:
+    """
+    从list中拼接出字符串的函数
+    """
+    if isinstance(content, str):
+        return content
+    elif isinstance(content, list):
+        final_string = ""
+        for text in content:
+            if isinstance(text, str):
+                final_string = final_string + text + '\n'
+            else:
+                final_string = final_string + str(text) + '\n'
+    return final_string
+
+
+def split_text_by_paragraphs(text, parag_per_chunk: int) -> List[str]:
+    """
+    根据段落将文本拆分的函数
+    """
+    # 检查text格式
+    if not text:
+        return []
+    
+    # 使用正则表达式分割成段落列表，并清除空段落
+    paragraphs = re.split(r'(\n\s*){2,}', text)
+
+    # 过滤掉分割后产生的空字符串或只包含空格的字符串
+    non_empty_paragraphs = [p.strip() for p in paragraphs if p and p.strip()]
+    
+    # 检查过滤后的文本list
+    if not non_empty_paragraphs:
+        return []
+    
+    # 遍历和提取list中的信息
+    text_chunks = []
+    for i in range(0, len(non_empty_paragraphs), parag_per_chunk):
+        # 获取当前块的段落
+        chunk_paragraphs = non_empty_paragraphs[i : i + parag_per_chunk]
+        # 使用 `\n\n` 将段落重新连接成一个文本块，以保留段落结构
+        text_chunk = "\n\n".join(chunk_paragraphs)
+        text_chunks.append(text_chunk)
+    return text_chunks
+    
+
 def json_extractor(content: str):
 
     """
@@ -76,6 +122,10 @@ def json_extractor(content: str):
     :param content: 大模型返回的字符串
     :return:
     """
+    # 转义\检查
+    pattern = re.compile(r'\\(?![\\"\/bfnrtu])')
+    content = pattern.sub(r'\\\\', content)
+
     # 第一次尝试：大模型返回了纯净的json字符串
     try: 
         return json.loads(content)
@@ -114,6 +164,7 @@ def json_extractor(content: str):
         pass 
 
     raise ValueError(f"无法从输入中提取JSON数据,当前的输入信息为：{content}")
+
 
 def find_files_in_directory(directory_path: str, target_extension: Optional[str] = None) -> List:
     """
@@ -201,7 +252,7 @@ def get_context_around_image(file_path: str, image_name: str, num_paragraphs: in
 
     if target_index == -1:
         print(f'警告：在文档中未找到图片 -> {image_name}')
-        return ""
+        return {"get_state": False, "get_content": ""}
 
     # 4. 计算上下文的起止索引
     #    使用 max(0, ...) 来处理前面段落不足 N 个的情况
@@ -214,7 +265,8 @@ def get_context_around_image(file_path: str, image_name: str, num_paragraphs: in
     context_paragraphs = paragraphs[start_index:end_index]
 
     # 6. 将提取的段落重新组合成一个字符串并返回
-    return '\n\n'.join(context_paragraphs)
+    # return '\n\n'.join(context_paragraphs)
+    return {"get_state": True, "get_content": '\n\n'.join(context_paragraphs)}
 
 
 def find_html_tables_in_markdown(file_path: str) -> List[str]:
@@ -340,7 +392,7 @@ def file_loader(file_path, output_dir: str=None) -> dict:
             if output_dir:
                 file_info = document_loader(file_path, output_dir=output_dir)
             else:
-                file_info = document_loader(file_path).load()
+                file_info = document_loader(file_path)
                 # print(f"返回的变量类型：{type(file_info)}")
 
         # 加载并返回文档内容
@@ -352,16 +404,6 @@ def file_loader(file_path, output_dir: str=None) -> dict:
 
 
 
-
-
-
-
-
-
-
-
-
-
 if __name__ == '__main__':
-    res = get_context_around_image(file_path='output/Document.md', image_name="image_1.png")
-    print(res)
+    parse_result = file_loader("/home/carlos/Projects/SmartAgent/data/Documents/2025数据分析Agent实践与案例研究报告.pdf", "./output")
+    print(parse_result)

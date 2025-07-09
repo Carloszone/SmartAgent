@@ -3,6 +3,7 @@ from pathlib import Path
 import uuid
 from loguru import logger
 import os
+import json
 
 from mineru.cli.common import convert_pdf_bytes_to_bytes_by_pypdfium2, prepare_env, read_fn
 from mineru.data.data_reader_writer import FileBasedDataWriter
@@ -26,6 +27,8 @@ def pdf_parse(
     p_formula_enable=True,  # Enable formula parsing
     p_table_enable=True,  # Enable table parsing
     f_dump_md=True,  # Whether to dump markdown files
+    f_dump_middle_json=True,
+    f_dump_content_list=True,
     f_make_md_mode=MakeMode.MM_MD,  # The mode for making markdown content, default is MM_MD
     start_page_id=0,  # Start page ID for parsing, default is 0
     end_page_id=None,  # End page ID for parsing, default is None (parse all pages until the end of the document)
@@ -63,10 +66,25 @@ def pdf_parse(
                 md_content_str,
             )
 
+        if f_dump_content_list:
+            image_dir = str(os.path.basename(local_image_dir))
+            content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
+            md_writer.write_string(
+                f"{pdf_file_name}_content_list.json",
+                json.dumps(content_list, ensure_ascii=False, indent=4),
+            )
+
+        # if f_dump_middle_json:
+        #     md_writer.write_string(
+        #         f"{pdf_file_name}_middle.json",
+        #         json.dumps(middle_json, ensure_ascii=False, indent=4),
+        #     )
+
         logger.info(f"local output dir is {local_md_dir}")
         return {'text_path': os.path.join(local_md_dir, f"{pdf_file_name}.md"),
+                "content_json_path": os.path.join(local_md_dir, f"{pdf_file_name}_content_list.json"),
                 "image_path": local_image_dir,
-                "temp_dir_path":os.path.join(output_dir, time_based_id)}
+                "temp_dir_path":local_md_dir}
 
 
 def pdf_loader(
@@ -117,29 +135,6 @@ def image_text_reader(image_path):
         else:
             pass
     return output_text
-
-
-# if __name__ == '__main__':
-#     __dir__ = os.path.dirname(os.path.abspath(__file__))
-#     project_root = os.path.dirname(__dir__)
-#     pdf_files_dir = os.path.join(__dir__, "pdfs")
-#     output_dir = os.path.join(project_root, "output")
-#     pdf_suffixes = [".pdf", ".docx", ".pptx"]
-#     image_suffixes = [".png", ".jpeg", ".jpg"]
-
-#     doc_path_list = ['output/b99a556e-56e5-11f0-8351-74563c6e57c2/auto/images/f2b23d170b3bf85055e3e8664805df1c920cac7d885baabcfcc4e40c6f335cb1.jpg']
-#     for doc_path in Path(pdf_files_dir).glob('*'):
-#         if doc_path.suffix in pdf_suffixes + image_suffixes:
-#             doc_path_list.append(doc_path)
-
-#     """如果您由于网络问题无法下载模型，可以设置环境变量MINERU_MODEL_SOURCE为modelscope使用免代理仓库下载模型"""
-#     # os.environ['MINERU_MODEL_SOURCE'] = "modelscope"
-
-#     """Use pipeline mode if your environment does not support VLM"""
-#     for path in doc_path_list:
-#         result = pdf_loader(path, output_dir)
-#         print(result)
-
 
 import docx
 import os
@@ -274,14 +269,3 @@ def get_image_r_id(paragraph):
         return None
     return None
 
-
-# --- 使用示例 ---
-if __name__ == '__main__':
-    # 假设您有一个名为 'mydocument.docx' 的文件
-    # 它包含文本、标题、一张图片和一个表格
-    try:
-        res = docx_to_markdown('data/Documents/Document.docx', 'output')
-        print(res)
-    except Exception as e:
-        print(f"创建或转换文档时出错: {e}")
-        print("请确保你有一个名为 'test_document.docx' 的文件在脚本同目录下。")

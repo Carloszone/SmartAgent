@@ -4,6 +4,7 @@
         "output_dir": "./output",
         "default_file_access_level": 0,
         "long_text_threshold": 50,
+        "default_parag_per_chunk": 3,
         "types":{
         "text_file_extension": [".txt", ".pdf", ".docx", ".md"],
         "table_file_extension": [".csv", ".xlsx", ".xls"],
@@ -19,7 +20,6 @@
         "audio_vad_model_address": "models/Fsmn-vad",
         "image_caption_model_name": "qwen2.5vl:7b",
         "ollama_model_option": {"temperature": 0}
-
     },
     "vector_database": {
         "host": "localhost",
@@ -27,6 +27,10 @@
         "grpc_port": 50051,
         "knewledge_base_collection_name": "knowledge_base_collection",
         "chat_collection_name": "chat_history_collection"
+    },
+    "search": {
+        "max_mun": 3,
+        "output_mun": 5
     },
     "others": {
         "model_retry_num": 3,
