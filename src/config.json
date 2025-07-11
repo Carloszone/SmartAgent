@@ -13,7 +13,7 @@
     }
     },
     "models":{
-        "generative_model_name": "qwen3:8b",
+        "generative_model_name": "qwen3:4b",
         "text_embedding_model_name": "bge-m3:567m",
         "audio_model_address_1": "models/FunsarParaformer-zh",
         "audio_model_address_2": "models/SenseVoice",
@@ -29,7 +29,7 @@
         "chat_collection_name": "chat_history_collection"
     },
     "search": {
-        "max_mun": 3,
+        "max_mun": 5,
         "output_mun": 5
     },
     "others": {

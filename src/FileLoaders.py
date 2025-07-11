@@ -43,7 +43,7 @@ def pdf_parse(
     infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = pipeline_doc_analyze(pdf_bytes_list, p_lang_list, parse_method=parse_method, formula_enable=p_formula_enable,table_enable=p_table_enable)
 
     for idx, model_list in enumerate(infer_results):
-        model_json = copy.deepcopy(model_list)
+        # model_json = copy.deepcopy(model_list)
         pdf_file_name = pdf_file_names[idx]
         local_image_dir, local_md_dir = prepare_env(output_dir, time_based_id, parse_method)
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
