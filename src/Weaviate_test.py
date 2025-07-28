@@ -37,15 +37,21 @@ try:
             tokenization=Tokenization.GSE,
             index_searchable=True
         ),
-        Property(
-            name="questions",
-            description="原始文本的派生问题",
-            data_type=DataType.TEXT,
-            tokenization=Tokenization.GSE,
-            index_searchable=True
-        ),
+        # Property(
+        #     name="questions",
+        #     description="原始文本的派生问题",
+        #     data_type=DataType.TEXT,
+        #     tokenization=Tokenization.GSE,
+        #     index_searchable=True
+        # ),
         Property(
             name="source",
+            description="来源文件路径或URL",
+            data_type=DataType.TEXT,
+            index_filterable=True
+        ),
+        Property(
+            name="chapter_info",
             description="来源文件路径或URL",
             data_type=DataType.TEXT,
             index_filterable=True
@@ -68,12 +74,12 @@ try:
             data_type=DataType.INT,
             index_filterable=True
         ),
-        # Property(
-        #     name="page_number",
-        #     description="在原始文件中的页码",
-        #     data_type=DataType.INT,
-        #     index_filterable=True
-        # ),
+        Property(
+            name="page_number",
+            description="在原始文件中的页码",
+            data_type=DataType.INT,
+            index_filterable=True
+        ),
         Property(
             name="chunk_seq_id",
             description="内容块的序列ID",
@@ -99,13 +105,13 @@ try:
                 source_properties=["summary"],
                 api_endpoint="http://ollama-host:11434",
                 model=embeding_model_name
-            ),
-            Configure.NamedVectors.text2vec_ollama(
-                name="question_vector",
-                source_properties=["questions"],
-                api_endpoint="http://ollama-host:11434",
-                model=embeding_model_name
             )
+            # Configure.NamedVectors.text2vec_ollama(
+            #     name="question_vector",
+            #     source_properties=["questions"],
+            #     api_endpoint="http://ollama-host:11434",
+            #     model=embeding_model_name
+            # )
         ],
         properties=properties_to_create
     )

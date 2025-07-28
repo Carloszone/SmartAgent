@@ -6,14 +6,14 @@ import textwrap
 from typing import List, Optional, Union
 import numpy as np
 from langchain_community.document_loaders import TextLoader
-from FileLoaders import pdf_loader, docx_Loader
+from .FileLoaders import pdf_loader
 from bs4 import BeautifulSoup
-
+from .tool import timing_decorator
 
 file_loader_mapping = {
             # 文档对象
             ".pdf": pdf_loader,
-            ".docx": docx_Loader,
+            # ".docx": docx_Loader,
             ".txt": TextLoader,
             ".md": TextLoader,
             ".text": TextLoader,
@@ -57,33 +57,21 @@ def get_system_message(mode: str):
         template = jinja2_env.get_template("AnswerSummaryTemplate.jinja2")
     elif mode == "text_correction":  # 文本纠偏模板
         template = jinja2_env.get_template("AudioTextCorrection.jinja2")
-    elif mode == "table_description":  # 表格描述模板
-        template = jinja2_env.get_template("TableSummaryTemplate.jinja2")
+    elif mode == "table_fusion":  # 表格整合模板
+        template = jinja2_env.get_template("TableFusionTemplate.jinja2")
+    elif mode == "table_convert":  # 表格转化模板
+        template = jinja2_env.get_template("Image2TableTemplate.jinja2")
     elif mode == "image_description":  # 图片描述融合模板
         template = jinja2_env.get_template("ImageDescriptionTemplate.jinja2")
     elif mode == "image_caption":  # 图片内容捕捉模板
         template = jinja2_env.get_template("ImageCaptionTemplate.jinja2")
+    elif mode == 'hyde':  # HyDE回答生成
+        template = jinja2_env.get_template('HyDETemplate.jinja2')
     else:
         raise ValueError(f'mode参数错误，当前参数为{mode}')
     message = textwrap.dedent(template.render())
 
     return message
-
-
-def fusion_list_str(content: Union[str, list]) -> str:
-    """
-    从list中拼接出字符串的函数
-    """
-    if isinstance(content, str):
-        return content
-    elif isinstance(content, list):
-        final_string = ""
-        for text in content:
-            if isinstance(text, str):
-                final_string = final_string + text + '\n'
-            else:
-                final_string = final_string + str(text) + '\n'
-    return final_string
 
 
 def split_text_by_paragraphs(text, parag_per_chunk: int) -> List[str]:
@@ -374,6 +362,7 @@ def html_to_json(html_content):
         print('未能找到表格信息')
         return ''
 
+@timing_decorator
 def file_loader(file_path, output_dir: str=None) -> dict:
     """
     读取文件的读取器
@@ -405,5 +394,15 @@ def file_loader(file_path, output_dir: str=None) -> dict:
 
 
 if __name__ == '__main__':
-    parse_result = file_loader("/home/carlos/Projects/SmartAgent/data/Documents/2025数据分析Agent实践与案例研究报告.pdf", "./output")
-    print(parse_result)
+    # parse_result = file_loader("/home/carlos/Projects/SmartAgent/data/Documents/2025数据分析Agent实践与案例研究报告.pdf", "./output")
+    # print(parse_result)
+
+    test_str = """
+```json
+{
+  "report": "表1主要检测仪器一览表，包含3列：序号、检测仪器名称、型号和仪器编号，共2行数据。"
+}
+```
+"""
+    output_content = json_extractor(test_str)
+    print(output_content)
