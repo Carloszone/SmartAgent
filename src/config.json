@@ -2,10 +2,9 @@
     "files":{
         "document_directory": "./data/Documents",
         "output_dir": "./output",
-        "default_file_access_level": 0,
         "long_text_threshold": 50,
         "default_parag_per_chunk": 3,
-        "chunk_seq_threshold": 10,
+        "chunk_seq_threshold": 20,
         "types":{
             "text_file_extension": [".txt", ".md"],
             "document_file_extension": [".pdf", ".docx", ".pptx"],
@@ -22,17 +21,18 @@
             "generative_model": "qwen3:4b",
             "text_embedding_model": "bge-m3:567m",
             "image_caption_model": "qwen2.5vl:7b",
-            "weaviate_api_endpoint": "http://ollama-host:11434"
+            "weaviate_api_endpoint": "http://ollama-host:11434",
+            "ollama_model_option": {"temperature": 0}
         },
         "remote_ollama_models": {
             "generative_model": "qwen3:14b",
             "text_embedding_model": "bge-m3:latest",
             "image_caption_model": "qwen2.5vl:7b",
-            "weaviate_api_endpoint": "http://remote-ollama-host:11434"
+            "weaviate_api_endpoint": "http://remote-ollama-host:11434",
+            "ollama_model_option": {"temperature": 0}
         },
         "audio_model_address": "models/FunsarParaformer-zh",
-        "audio_vad_model_address": "models/Fsmn-vad",
-        "ollama_model_option": {"temperature": 0}
+        "audio_vad_model_address": "models/Fsmn-vad"
     },
     "vector_database": {
         "local": {
@@ -45,14 +45,12 @@
         },
         "remote": {
 
-        },
-        "knewledge_base_collection_name": "knowledge_base_collection",
-        "chat_collection_name": "chat_history_collection"
+        }
     },
     "search": {
-        "max_mun": 30,
-        "rerank_num": 10, 
-        "output_mun": 3
+        "first_output": 30,
+        "second_output": 10, 
+        "final_output": 3
     },
     "others": {
         "model_retry_num": 3,

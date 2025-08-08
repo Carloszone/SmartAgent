@@ -8,10 +8,8 @@ import time
 from typing import List, Union, Optional
 from langchain_core.documents import Document
 from .ContentHandler import get_system_message, json_extractor, file_loader, html_to_json, split_text_by_paragraphs
-from .DatabaseOperation import connect_to_weative_database, close_weavier_connection, create_collection, delete_collection, save_to_vector_database, rerank_distances_with_softmax, db_search
-import weaviate
-from src.Models import connect_to_ollama
-import asyncio
+from .DBHandler import VectorDatabase
+from src.Models import RagModels
 from weaviate.classes.query import MetadataQuery
 from weaviate.util import generate_uuid5
 import pandas as pd
@@ -26,7 +24,6 @@ from pathlib import Path
 import warnings
 import json
 import gc
-import weaviate.classes as wvc
 from .tool import standard_competition_ranking, get_chunk_text, timing_decorator
 from tqdm import tqdm
 
@@ -35,24 +32,10 @@ class RAGTool:
     """
     执行RAG相关操作的类
     """
-    def __init__(self, db_client, ollama_client, async_ollama_client, is_remote):
+    def __init__(self, db_instance, model_instance):
         # 传入参数
-        self.db_client = db_client  # 向量数据库的客户端
-        self.client = ollama_client  # ollama客户端
-        self.async_client = async_ollama_client  # 异步ollama客户断
-        self.is_remote = is_remote
-
-        # 模型相关
-        self.model_settings = config.get_setting("models")
-        self.ollama_model_option = config.get_setting("models")["ollama_model_option"]  # ollama模型额外参数
-        if is_remote:
-            self.ollama_model_settings = self.model_settings["remote_ollama_models"]
-        else:
-            self.ollama_model_settings = self.model_settings["local_ollama_models"]
-
-        # 数据库相关
-        self.knewledge_base_collection_name = config.get_setting("vector_database")["knewledge_base_collection_name"]  # 知识库collection的名称
-        self.chat_collection_name = config.get_setting("vector_database")["chat_collection_name"]  # 聊天记录collection的名称
+        self.db_instance = db_instance
+        self.model_instance = model_instance
 
         # 文档相关
         self.long_text_threshold = config.get_setting("files")["long_text_threshold"]  # 长文本的最低字符限制
@@ -60,17 +43,11 @@ class RAGTool:
         self.chunk_seq_threshold = config.get_setting("files")["chunk_seq_threshold"]  # 不分块的最大段落数
         self.file_types_category = config.get_setting("files")["types"]  # 当前支持的文档类型字典
 
-        # 检索相关
-        self.search_max_num = config.get_setting("search")["max_mun"]  # 每次独立搜索返回的结果数量
-        self.search_rerank_num = config.get_setting("search")["rerank_num"]  # 每次rerank返回的结果数量
-        self.search_output_num = config.get_setting("search")["output_mun"]  # 输出的最大文档数量
-
         # 输出相关
         script_path = os.path.abspath(__file__)
         script_dir = os.path.dirname(script_path)
         project_root = os.path.dirname(script_dir)
         self.output_dir = os.path.join(project_root, config.get_setting("files")["output_dir"])
-
 
         # 其他参数：
         self.model_retry_num = 3  # 遇到模型报错时的重试次数
@@ -1412,15 +1389,14 @@ if __name__ == '__main__':
         # '/home/carlos/Projects/SmartAgent/data/Documents/C00016934-于畅-数据分析工程师.pdf'
         ]
     
-    # 连接向量数据库
-    print('连接向量数据库')
+    # 创建向量数据库实例
+    print('创建向量数据库实例')
     db_client_params = config.get_setting("vector_database")["local"]
-    db_client = connect_to_weative_database(db_client_params)
+    weaviate_db_instance = VectorDatabase(db_params=db_client_params)
 
-    # 连接ollama模型
-    print('连接ollama服务器')
-    ollama_address = config.get_setting("models")["ollama_remote_address"]  # ollama的地址
-    ollama_client, ollama_async_client, remote_flag = connect_to_ollama(ollama_address=ollama_address)
+    # 创建模型实例
+    print('创建模型实例')
+    rag_model_instance = RagModels()
 
     # 创建RAG实例
     print('创建RAG实例')

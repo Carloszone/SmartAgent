@@ -58,6 +58,7 @@ def file_type_identifier(file_path) -> str:
 
 ### pdf 解析函数
 def pdf_parse(
+    file_type,  # 文件类型
     output_dir,  # Output directory for storing parsing results
     pdf_file_names: list[str],  # List of PDF file names to be parsed
     pdf_bytes_list: list[bytes],  # List of PDF bytes to be parsed
@@ -97,21 +98,27 @@ def pdf_parse(
 
         pdf_bytes = pdf_bytes_list[idx]
 
-        if f_dump_md:
-            image_dir = str(os.path.basename(local_image_dir))
-            md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
-            md_writer.write_string(
-                f"{pdf_file_name}.md",
-                md_content_str,
-            )
+        if file_type == 'document':
+            if f_dump_md:
+                image_dir = str(os.path.basename(local_image_dir))
+                md_content_str = pipeline_union_make(pdf_info, f_make_md_mode, image_dir)
+                md_writer.write_string(
+                    f"{pdf_file_name}.md",
+                    md_content_str,
+                )
 
-        if f_dump_content_list:
+            if f_dump_content_list:
+                image_dir = str(os.path.basename(local_image_dir))
+                content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
+                md_writer.write_string(
+                    f"{pdf_file_name}_content_list.json",
+                    json.dumps(content_list, ensure_ascii=False, indent=4),
+                )
+        
+        if file_type == "image":
             image_dir = str(os.path.basename(local_image_dir))
             content_list = pipeline_union_make(pdf_info, MakeMode.CONTENT_LIST, image_dir)
-            md_writer.write_string(
-                f"{pdf_file_name}_content_list.json",
-                json.dumps(content_list, ensure_ascii=False, indent=4),
-            )
+            return content_list
 
         # if f_dump_middle_json:
         #     md_writer.write_string(
@@ -141,12 +148,14 @@ def pdf_loader(
         file_name_list = []
         pdf_bytes_list = []
         lang_list = []
+        file_type = file_type_identifier(file_path)
         file_name = str(Path(file_path).stem)
         pdf_bytes = read_fn(file_path)
         file_name_list.append(file_name)
         pdf_bytes_list.append(pdf_bytes)
         lang_list.append(lang)
         extraction_info = pdf_parse(
+                file_type=file_type,
                 output_dir=output_dir,
                 pdf_file_names=file_name_list,
                 pdf_bytes_list=pdf_bytes_list,
@@ -244,7 +253,6 @@ def analyze_paragraphs(doc: Document, paragraph: Paragraph, image_save_path: str
     result["full_text"] = paragraph.text
     return result
 
-
 def table_to_simple_html(table: Table):
     """
     将表格对象内容转为html格式的函数
@@ -281,7 +289,6 @@ def table_to_simple_html(table: Table):
 
     table_text = "\n".join(html_lines)
     return {"full_text": table_text, "element_type": "table", "paragraph_style_id": None}
-
 
 def docx_to_content_list(docx_path: str, output_dir: str = 'output_images') -> dict:
     """
@@ -456,9 +463,6 @@ def docx_to_content_list(docx_path: str, output_dir: str = 'output_images') -> d
 
 
 
-
-
-
 ### pptx 解析函数
 
 if __name__ == '__main__':
@@ -466,5 +470,10 @@ if __name__ == '__main__':
     file_path = '/home/carlos/Projects/SmartAgent/data/Documents/Document.docx'
 
 
-    result = docx_to_content_list(file_path, output_dir='./upload')
-    print(result)
+    # result = docx_to_content_list(file_path, output_dir='./upload')
+    # print(result)
+
+    file_path = '/home/carlos/Projects/SmartAgent/data/images/test_01.jpg'
+
+    pdf_loader(file_path=file_path,
+               output_dir='./output')

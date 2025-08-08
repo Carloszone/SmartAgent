@@ -49,8 +49,8 @@ def get_system_message(mode: str):
         template = jinja2_env.get_template("TextSummaryTemplate.jinja2")
     elif mode == "keywords":  # 文本关键词提取模板
         template = jinja2_env.get_template("KeywordsTemplate.jinja2")
-    elif mode == "questions":  # 文本提问模板
-        template = jinja2_env.get_template("QuestionGenerationTemplate.jinja2")
+    elif mode == "query":  # 文本提问模板
+        template = jinja2_env.get_template("QueryTransformationTemplate.jinja2")
     elif mode == "topic_extraction":  # 主题提取模板
         template = jinja2_env.get_template("TopicExtractionTemplate.jinja2")
     elif mode == "answer_summary":  # 回答摘要模板
@@ -59,9 +59,9 @@ def get_system_message(mode: str):
         template = jinja2_env.get_template("AudioTextCorrection.jinja2")
     elif mode == "table_fusion":  # 表格整合模板
         template = jinja2_env.get_template("TableFusionTemplate.jinja2")
-    elif mode == "table_convert":  # 表格转化模板
+    elif mode == "image_convert_to_html":  # 图像转html模板
         template = jinja2_env.get_template("Image2TableTemplate.jinja2")
-    elif mode == "image_description":  # 图片描述融合模板
+    elif mode == "image_description":  # 图片描述模板
         template = jinja2_env.get_template("ImageDescriptionTemplate.jinja2")
     elif mode == "image_caption":  # 图片内容捕捉模板
         template = jinja2_env.get_template("ImageCaptionTemplate.jinja2")
@@ -362,7 +362,6 @@ def html_to_json(html_content):
         print('未能找到表格信息')
         return ''
 
-@timing_decorator
 def file_loader(file_path, output_dir: str=None) -> dict:
     """
     读取文件的读取器
